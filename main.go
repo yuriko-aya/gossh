@@ -213,6 +213,20 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Validate remote path - only allow downloads from /home, /opt, and /tmp
+	allowedPaths := []string{"/home/", "/opt/", "/tmp/"}
+	isAllowed := false
+	for _, prefix := range allowedPaths {
+		if strings.HasPrefix(remotePath, prefix) {
+			isAllowed = true
+			break
+		}
+	}
+	if !isAllowed {
+		http.Error(w, "Access denied: Downloads are only allowed from /home, /opt, and /tmp directories", http.StatusForbidden)
+		return
+	}
+
 	var privateKey []byte
 	var err error
 	if privateKeyB64 != "" {

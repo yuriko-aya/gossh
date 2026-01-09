@@ -375,6 +375,19 @@ func uploadFileViaSSH(file multipart.File, filename, host, user, password string
 }
 
 func downloadFileViaSSH(w http.ResponseWriter, remotePath, host, user, password string, privateKey []byte) (string, error) {
+	// Validate remote path - only allow downloads from /home, /opt, and /tmp
+	allowedPaths := []string{"/home/", "/opt/", "/tmp/"}
+	isAllowed := false
+	for _, prefix := range allowedPaths {
+		if len(remotePath) >= len(prefix) && remotePath[:len(prefix)] == prefix {
+			isAllowed = true
+			break
+		}
+	}
+	if !isAllowed {
+		return "", fmt.Errorf("access denied: downloads are only allowed from /home, /opt, and /tmp directories")
+	}
+
 	// Build SSH client configuration
 	config := &ssh.ClientConfig{
 		User:            user,
