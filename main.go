@@ -19,12 +19,12 @@ import (
 
 type Config struct {
 	Server struct {
-		Address string `json:"address"`
-		Port    int    `json:"port"`
-	} `json:"server"`
+		Address string `yaml:"address"`
+		Port    int    `yaml:"port"`
+	} `yaml:"server"`
 	Security struct {
-		FernetKey string `json:"fernet_key"`
-	} `json:"security"`
+		FernetKey string `yaml:"fernet_key"`
+	} `yaml:"security"`
 }
 
 var (
@@ -50,6 +50,14 @@ func init() {
 	// Load configuration
 	if err := loadConfig("config.yaml"); err != nil {
 		log.Fatalf("Failed to load config: %v", err)
+	}
+
+	// Validate Fernet key
+	if config.Security.FernetKey == "" {
+		log.Fatal("Fernet key is not configured. Please set security.fernet_key in config.yaml")
+	}
+	if _, err := fernet.DecodeKeys(config.Security.FernetKey); err != nil {
+		log.Fatalf("Invalid Fernet key in config: %v", err)
 	}
 
 	// Load templates
@@ -253,11 +261,21 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 func decryptAccess(encrypted string) (SSHCredentials, error) {
 	var creds SSHCredentials
 
+	// Get and validate Fernet key
+	fernetKey := getDefaultFernetKey()
+	if fernetKey == "" {
+		return creds, fmt.Errorf("fernet key not configured")
+	}
+
 	// Decode the Fernet token
-	key := fernet.MustDecodeKeys(getDefaultFernetKey())
+	key, err := fernet.DecodeKeys(fernetKey)
+	if err != nil {
+		return creds, fmt.Errorf("invalid fernet key: %v", err)
+	}
+
 	token_64 := fernet.VerifyAndDecrypt([]byte(encrypted), 0, key)
 	if token_64 == nil {
-		return creds, http.ErrAbortHandler
+		return creds, fmt.Errorf("failed to decrypt access token")
 	}
 
 	token, err := base64.StdEncoding.DecodeString(string(token_64))
