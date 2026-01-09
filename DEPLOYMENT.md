@@ -16,8 +16,8 @@ On your development machine or CI/CD pipeline:
 
 ```bash
 # Clone the repository
-git clone https://github.com/yuriko-aya/gosh.git
-cd gosh
+git clone https://github.com/yuriko-aya/gossh.git
+cd gossh
 
 # Build for Linux
 GOOS=linux GOARCH=amd64 go build -o gossh -ldflags="-s -w"
@@ -51,7 +51,7 @@ sudo chown -R gossh:gossh /var/log/gossh
 
 ```bash
 # On the server, clone the repository
-sudo -u gossh git clone https://github.com/yuriko-aya/gosh.git /opt/gossh
+sudo -u gossh git clone https://github.com/yuriko-aya/gossh.git /opt/gossh
 cd /opt/gossh
 
 # Build on server (requires Go installed)

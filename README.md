@@ -2,7 +2,7 @@
 
 A secure web-based SSH bastion/gateway built with Go, WebSocket, and xterm.js.
 
-**GitHub Repository**: https://github.com/yuriko-aya/gosh
+**GitHub Repository**: https://github.com/yuriko-aya/gossh
 
 ## Features
 
@@ -22,8 +22,8 @@ A secure web-based SSH bastion/gateway built with Go, WebSocket, and xterm.js.
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/yuriko-aya/gosh.git
-cd gosh
+git clone https://github.com/yuriko-aya/gossh.git
+cd gossh
 ```
 
 2. Install dependencies:
