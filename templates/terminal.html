@@ -1,0 +1,479 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SSH Terminal</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@6.0/css/xterm.min.css" />
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: #1e1e1e;
+            overflow: hidden;
+            height: 100vh;
+            width: 100vw;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .status {
+            color: white;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 10px 20px;
+            font-size: 14px;
+            background: #2d2d2d;
+            flex-shrink: 0;
+        }
+        
+        .status-text {
+            flex: 1;
+            text-align: center;
+        }
+        
+        .upload-btn {
+            background: #667eea;
+            color: white;
+            border: none;
+            padding: 6px 15px;
+            border-radius: 4px;
+            font-size: 13px;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+        
+        .upload-btn:hover {
+            background: #5568d3;
+        }
+        
+        .upload-btn:disabled {
+            background: #555;
+            cursor: not-allowed;
+        }
+        
+        .download-btn {
+            background: #28a745;
+            color: white;
+            border: none;
+            padding: 6px 15px;
+            border-radius: 4px;
+            font-size: 13px;
+            cursor: pointer;
+            transition: background 0.2s;
+            margin-left: 10px;
+        }
+        
+        .download-btn:hover {
+            background: #218838;
+        }
+        
+        .download-btn:disabled {
+            background: #555;
+            cursor: not-allowed;
+        }
+        
+        #fileInput {
+            display: none;
+        }
+        
+        .upload-progress {
+            position: fixed;
+            bottom: 60px;
+            right: 20px;
+            background: #2d2d2d;
+            color: white;
+            padding: 15px 20px;
+            border-radius: 8px;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+            min-width: 300px;
+            display: none;
+        }
+        
+        .upload-progress.active {
+            display: block;
+        }
+        
+        .progress-bar {
+            width: 100%;
+            height: 20px;
+            background: #1e1e1e;
+            border-radius: 10px;
+            margin-top: 10px;
+            overflow: hidden;
+        }
+        
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #667eea, #764ba2);
+            width: 0%;
+            transition: width 0.3s;
+        }
+        
+        .progress-text {
+            font-size: 12px;
+            margin-top: 5px;
+            color: #aaa;
+        }
+
+        #terminal {
+            flex: 1;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+        }
+        
+        .xterm {
+            height: 100%;
+            width: 100%;
+        }
+        
+        .xterm-viewport {
+            overflow-y: auto !important;
+        }
+    </style>
+</head>
+<body>
+    <div class="status">
+        <div></div>
+        <div class="status-text" id="status">Connecting...</div>
+        <div>
+            <button class="upload-btn" id="uploadBtn" disabled>Upload File</button>
+            <button class="download-btn" id="downloadBtn" disabled>Download File</button>
+        </div>
+    </div>
+    <div id="terminal"></div>
+    <input type="file" id="fileInput" accept="*" />
+    
+    <div class="upload-progress" id="uploadProgress">
+        <div id="uploadFileName">Uploading...</div>
+        <div class="progress-bar">
+            <div class="progress-fill" id="progressFill"></div>
+        </div>
+        <div class="progress-text" id="progressText">0% - 0 MB / 0 MB</div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@6.0/lib/xterm.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.11/lib/addon-fit.min.js"></script>
+    <script>
+        let term;
+        let socket;
+        let fitAddon;
+
+        function updateStatus(message, type) {
+            const statusEl = document.getElementById('status');
+            statusEl.textContent = message;
+            statusEl.style.color = type === 'success' ? '#98c379' : type === 'error' ? '#e06c75' : '#ffffff';
+        }
+        
+        function handleFileDownload(host, user) {
+            const remotePath = prompt('Enter remote file path to download (e.g., /tmp/myfile.txt):');
+            if (!remotePath || remotePath.trim() === '') return;
+            
+            const downloadBtn = document.getElementById('downloadBtn');
+            downloadBtn.disabled = true;
+            downloadBtn.textContent = 'Downloading...';
+            
+            term.write(`\r\n\x1b[1;36mDownloading ${remotePath}...\x1b[0m\r\n`);
+            
+            // Get credentials from URL params
+            const params = new URLSearchParams(window.location.search);
+            
+            // Build download URL with credentials
+            const downloadUrl = new URL('/download', window.location.origin);
+            downloadUrl.searchParams.set('host', host);
+            downloadUrl.searchParams.set('user', user);
+            downloadUrl.searchParams.set('password', params.get('password') || '');
+            downloadUrl.searchParams.set('privatekey', params.get('privatekey') || '');
+            downloadUrl.searchParams.set('path', remotePath);
+            
+            // Create invisible iframe to trigger download
+            const iframe = document.createElement('iframe');
+            iframe.style.display = 'none';
+            iframe.src = downloadUrl.toString();
+            document.body.appendChild(iframe);
+            
+            // Check if download succeeded
+            setTimeout(() => {
+                term.write(`\r\n\x1b[1;32mDownload started. Check your browser downloads.\x1b[0m\r\n`);
+                downloadBtn.disabled = false;
+                downloadBtn.textContent = 'Download File';
+                document.body.removeChild(iframe);
+                
+                // Send enter to show prompt
+                if (socket && socket.readyState === WebSocket.OPEN) {
+                    socket.send(JSON.stringify({ type: 'input', data: '\r' }));
+                }
+            }, 1000);
+        }
+        
+        function handleFileUpload(host, user) {
+            const fileInput = document.getElementById('fileInput');
+            const uploadBtn = document.getElementById('uploadBtn');
+            
+            fileInput.click();
+            
+            fileInput.onchange = function(e) {
+                const file = e.target.files[0];
+                if (!file) return;
+                
+                // Check file size (2GB limit)
+                const maxSize = 2 * 1024 * 1024 * 1024; // 2GB
+                if (file.size > maxSize) {
+                    term.write('\r\n\x1b[1;31mError: File size exceeds 2GB limit\x1b[0m\r\n');
+                    fileInput.value = '';
+                    return;
+                }
+                
+                uploadBtn.disabled = true;
+                uploadBtn.textContent = 'Uploading...';
+                
+                // Show progress UI
+                const progressDiv = document.getElementById('uploadProgress');
+                const progressFill = document.getElementById('progressFill');
+                const progressText = document.getElementById('progressText');
+                const fileNameEl = document.getElementById('uploadFileName');
+                
+                fileNameEl.textContent = `Uploading ${file.name}`;
+                progressDiv.classList.add('active');
+                progressFill.style.width = '0%';
+                progressText.textContent = '0% - 0 MB / ' + (file.size / 1024 / 1024).toFixed(2) + ' MB';
+                
+                term.write(`\r\n\x1b[1;36mUploading ${file.name} (${(file.size / 1024 / 1024).toFixed(2)} MB)...\x1b[0m\r\n`);
+                
+                // Use FormData for proper file upload
+                const formData = new FormData();
+                formData.append('file', file);
+                formData.append('host', host);
+                formData.append('user', user);
+                
+                // Get password and privatekey from URL params
+                const params = new URLSearchParams(window.location.search);
+                formData.append('password', params.get('password') || '');
+                formData.append('privatekey', params.get('privatekey') || '');
+                
+                // Use XMLHttpRequest for progress tracking
+                const xhr = new XMLHttpRequest();
+                
+                xhr.upload.addEventListener('progress', function(e) {
+                    if (e.lengthComputable) {
+                        const percentComplete = (e.loaded / e.total) * 100;
+                        const mbLoaded = (e.loaded / 1024 / 1024).toFixed(2);
+                        const mbTotal = (e.total / 1024 / 1024).toFixed(2);
+                        
+                        progressFill.style.width = percentComplete + '%';
+                        progressText.textContent = percentComplete.toFixed(0) + '% - ' + mbLoaded + ' MB / ' + mbTotal + ' MB';
+                    }
+                });
+                
+                xhr.addEventListener('load', function() {
+                    if (xhr.status === 200) {
+                        const data = JSON.parse(xhr.responseText);
+                        if (data.success) {
+                            progressText.textContent = '100% - Upload complete!';
+                            term.write(`\r\n\x1b[1;32mFile uploaded successfully to ${data.path}\x1b[0m\r\n`);
+                            
+                            // Send enter key to show shell prompt
+                            setTimeout(() => {
+                                if (socket && socket.readyState === WebSocket.OPEN) {
+                                    socket.send(JSON.stringify({ type: 'input', data: '\r' }));
+                                }
+                            }, 300);
+                        } else {
+                            term.write(`\r\n\x1b[1;31mUpload failed: ${data.error}\x1b[0m\r\n`);
+                        }
+                    } else {
+                        term.write(`\r\n\x1b[1;31mUpload failed: Server error\x1b[0m\r\n`);
+                    }
+                    
+                    // Hide progress after delay
+                    setTimeout(() => {
+                        progressDiv.classList.remove('active');
+                        uploadBtn.disabled = false;
+                        uploadBtn.textContent = 'Upload File';
+                        fileInput.value = '';
+                    }, 2000);
+                });
+                
+                xhr.addEventListener('error', function() {
+                    term.write(`\r\n\x1b[1;31mUpload failed: Network error\x1b[0m\r\n`);
+                    progressDiv.classList.remove('active');
+                    uploadBtn.disabled = false;
+                    uploadBtn.textContent = 'Upload File';
+                    fileInput.value = '';
+                });
+                
+                xhr.open('POST', '/upload', true);
+                xhr.send(formData);
+            };
+        }
+
+        function connectSSH(host, user, password, privatekey) {
+            // Initialize xterm.js terminal
+            term = new Terminal({
+                cursorBlink: true,
+                fontSize: 14,
+                fontFamily: 'Consolas, "Courier New", monospace',
+                scrollback: 1000,
+                theme: {
+                    background: '#1e1e1e',
+                    foreground: '#ffffff',
+                    cursor: '#ffffff',
+                    selection: 'rgba(255, 255, 255, 0.3)',
+                    black: '#000000',
+                    red: '#e06c75',
+                    green: '#98c379',
+                    yellow: '#d19a66',
+                    blue: '#61afef',
+                    magenta: '#c678dd',
+                    cyan: '#56b6c2',
+                    white: '#abb2bf',
+                    brightBlack: '#5c6370',
+                    brightRed: '#e06c75',
+                    brightGreen: '#98c379',
+                    brightYellow: '#d19a66',
+                    brightBlue: '#61afef',
+                    brightMagenta: '#c678dd',
+                    brightCyan: '#56b6c2',
+                    brightWhite: '#ffffff'
+                },
+                convertEol: true
+            });
+
+            // Fit addon to make terminal responsive
+            fitAddon = new FitAddon.FitAddon();
+            term.loadAddon(fitAddon);
+
+            // Open terminal in the container
+            const terminalElement = document.getElementById('terminal');
+            term.open(terminalElement);
+            
+            // Function to properly fit the terminal
+            function fitTerminal() {
+                try {
+                    fitAddon.fit();
+                    if (socket && socket.readyState === WebSocket.OPEN) {
+                        const dims = {
+                            type: 'resize',
+                            cols: term.cols,
+                            rows: term.rows
+                        };
+                        socket.send(JSON.stringify(dims));
+                    }
+                } catch (e) {
+                    console.error('Error fitting terminal:', e);
+                }
+            }
+            
+            // Initial fit with small delay
+            setTimeout(fitTerminal, 50);
+            setTimeout(fitTerminal, 200);
+
+            // Handle window resize with debouncing
+            let resizeTimeout;
+            window.addEventListener('resize', () => {
+                clearTimeout(resizeTimeout);
+                resizeTimeout = setTimeout(fitTerminal, 50);
+            });
+
+            // Build WebSocket URL
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsUrl = `${protocol}//${window.location.host}/ws?host=${encodeURIComponent(host)}&user=${encodeURIComponent(user)}&password=${encodeURIComponent(password)}&privatekey=${encodeURIComponent(privatekey)}`;
+
+            // Connect to WebSocket
+            socket = new WebSocket(wsUrl);
+
+            socket.onopen = function() {
+                updateStatus(`Connected to ${user}@${host}`, 'success');
+                
+                // Enable upload and download buttons
+                const uploadBtn = document.getElementById('uploadBtn');
+                const downloadBtn = document.getElementById('downloadBtn');
+                uploadBtn.disabled = false;
+                downloadBtn.disabled = false;
+                uploadBtn.onclick = () => handleFileUpload(host, user);
+                downloadBtn.onclick = () => handleFileDownload(host, user);
+                
+                // Fit terminal again after connection and send size
+                setTimeout(() => {
+                    fitAddon.fit();
+                    const dims = {
+                        type: 'resize',
+                        cols: term.cols,
+                        rows: term.rows
+                    };
+                    socket.send(JSON.stringify(dims));
+                }, 100);
+            };
+
+            socket.onmessage = function(event) {
+                // Write received data to terminal
+                term.write(event.data);
+            };
+
+            socket.onerror = function(error) {
+                console.error('WebSocket error:', error);
+                updateStatus(`Connection error - ${user}@${host}`, 'error');
+                term.write('\r\n\x1b[1;31mConnection error occurred\x1b[0m\r\n');
+            };
+
+            socket.onclose = function() {
+                updateStatus(`Disconnected from ${user}@${host}`, 'error');
+                term.write('\r\n\x1b[1;33mConnection closed\x1b[0m\r\n');
+                
+                // Disable upload button
+                document.getElementById('uploadBtn').disabled = true;
+                
+                // Close the window after a short delay
+                setTimeout(function() {
+                    window.close();
+                }, 1500);
+            };
+
+            // Send terminal input to WebSocket
+            term.onData(function(data) {
+                if (socket && socket.readyState === WebSocket.OPEN) {
+                    socket.send(JSON.stringify({ type: 'input', data: data }));
+                }
+            });
+        }
+
+        // Get connection parameters from URL
+        window.addEventListener('load', function() {
+            const params = new URLSearchParams(window.location.search);
+            let host = params.get('host');
+            let user = params.get('user');
+            let password = params.get('password') || '';
+            let privatekey = params.get('privatekey') || '';
+            
+            // Check if credentials are in template (from access token)
+            const templateHost = '{{.Host}}';
+            const templateUser = '{{.User}}';
+            const templatePrivateKey = '{{.PrivateKey}}';
+            
+            // Use template credentials if available (access token mode)
+            if (templateHost && templateUser) {
+                host = templateHost;
+                user = templateUser;
+                privatekey = templatePrivateKey;
+            }
+            
+            if (host && user) {
+                // Update window title
+                document.title = `SSH - ${user}@${host}`;
+                
+                // Update status to show connection details
+                updateStatus(`Connecting to ${user}@${host}...`, 'info');
+                
+                connectSSH(host, user, password, privatekey);
+            }
+        });
+    </script>
+</body>
+</html>

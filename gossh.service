@@ -1,0 +1,28 @@
+[Unit]
+Description=Go SSH Web Terminal
+After=network.target
+
+[Service]
+Type=simple
+User=gossh
+Group=gossh
+WorkingDirectory=/opt/gossh
+ExecStart=/opt/gossh/gossh
+Restart=always
+RestartSec=10
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/log/gossh
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=gossh
+
+[Install]
+WantedBy=multi-user.target
