@@ -440,6 +440,7 @@
 
             // Connect to WebSocket
             socket = new WebSocket(wsUrl);
+            socket.binaryType = 'arraybuffer'; // Handle binary data as ArrayBuffer for better performance
 
             socket.onopen = function() {
                 updateStatus(`Connected to ${user}@${host}`, 'success');
@@ -469,8 +470,22 @@
             };
 
             socket.onmessage = function(event) {
-                // Write received data to terminal
-                term.write(event.data);
+                // Handle binary WebSocket messages
+                if (event.data instanceof Blob) {
+                    const reader = new FileReader();
+                    reader.onload = function() {
+                        const arrayBuffer = reader.result;
+                        const uint8Array = new Uint8Array(arrayBuffer);
+                        term.write(uint8Array);
+                    };
+                    reader.readAsArrayBuffer(event.data);
+                } else if (event.data instanceof ArrayBuffer) {
+                    const uint8Array = new Uint8Array(event.data);
+                    term.write(uint8Array);
+                } else {
+                    // Fallback for text messages
+                    term.write(event.data);
+                }
             };
 
             socket.onerror = function(error) {

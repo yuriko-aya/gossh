@@ -131,7 +131,7 @@ func handleSSHConnection(wsConn *websocket.Conn, host, user, password string, pr
 				return
 			}
 			if n > 0 {
-				wsConn.WriteMessage(websocket.TextMessage, buf[:n])
+				wsConn.WriteMessage(websocket.BinaryMessage, buf[:n])
 			}
 		}
 	}()
@@ -147,7 +147,7 @@ func handleSSHConnection(wsConn *websocket.Conn, host, user, password string, pr
 				return
 			}
 			if n > 0 {
-				wsConn.WriteMessage(websocket.TextMessage, buf[:n])
+				wsConn.WriteMessage(websocket.BinaryMessage, buf[:n])
 			}
 		}
 	}()
