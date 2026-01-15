@@ -137,9 +137,61 @@
         .xterm-viewport {
             overflow-y: auto !important;
         }
+        
+        .loading-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: #1e1e1e;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            z-index: 1000;
+            transition: opacity 0.3s ease;
+        }
+        
+        .loading-overlay.hidden {
+            opacity: 0;
+            pointer-events: none;
+        }
+        
+        .spinner {
+            border: 4px solid #2d2d2d;
+            border-top: 4px solid #667eea;
+            border-radius: 50%;
+            width: 50px;
+            height: 50px;
+            animation: spin 1s linear infinite;
+        }
+        
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        
+        .loading-text {
+            color: #aaa;
+            margin-top: 20px;
+            font-size: 14px;
+        }
+        
+        .loading-details {
+            color: #667eea;
+            margin-top: 10px;
+            font-size: 12px;
+        }
     </style>
 </head>
 <body>
+    <div class="loading-overlay" id="loadingOverlay">
+        <div class="spinner"></div>
+        <div class="loading-text">Establishing SSH Connection</div>
+        <div class="loading-details" id="loadingDetails">Connecting...</div>
+    </div>
+    
     <div class="status">
         <div></div>
         <div class="status-text" id="status">Connecting...</div>
@@ -392,6 +444,10 @@
             socket.onopen = function() {
                 updateStatus(`Connected to ${user}@${host}`, 'success');
                 
+                // Hide loading overlay
+                const loadingOverlay = document.getElementById('loadingOverlay');
+                loadingOverlay.classList.add('hidden');
+                
                 // Enable upload and download buttons
                 const uploadBtn = document.getElementById('uploadBtn');
                 const downloadBtn = document.getElementById('downloadBtn');
@@ -470,6 +526,10 @@
                 
                 // Update status to show connection details
                 updateStatus(`Connecting to ${user}@${host}...`, 'info');
+                
+                // Update loading details
+                const loadingDetails = document.getElementById('loadingDetails');
+                loadingDetails.textContent = `Connecting to ${user}@${host}...`;
                 
                 connectSSH(host, user, password, privatekey);
             }
