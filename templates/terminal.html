@@ -217,6 +217,7 @@
         let term;
         let socket;
         let fitAddon;
+        let sshCredentials = { host: '', user: '', password: '', privatekey: '' };
 
         function updateStatus(message, type) {
             const statusEl = document.getElementById('status');
@@ -234,15 +235,12 @@
             
             term.write(`\r\n\x1b[1;36mDownloading ${remotePath}...\x1b[0m\r\n`);
             
-            // Get credentials from URL params
-            const params = new URLSearchParams(window.location.search);
-            
-            // Build download URL with credentials
+            // Build download URL with credentials from global storage
             const downloadUrl = new URL('/download', window.location.origin);
-            downloadUrl.searchParams.set('host', host);
-            downloadUrl.searchParams.set('user', user);
-            downloadUrl.searchParams.set('password', params.get('password') || '');
-            downloadUrl.searchParams.set('privatekey', params.get('privatekey') || '');
+            downloadUrl.searchParams.set('host', sshCredentials.host);
+            downloadUrl.searchParams.set('user', sshCredentials.user);
+            downloadUrl.searchParams.set('password', sshCredentials.password);
+            downloadUrl.searchParams.set('privatekey', sshCredentials.privatekey);
             downloadUrl.searchParams.set('path', remotePath);
             
             // Create invisible iframe to trigger download
@@ -302,13 +300,12 @@
                 // Use FormData for proper file upload
                 const formData = new FormData();
                 formData.append('file', file);
-                formData.append('host', host);
-                formData.append('user', user);
+                formData.append('host', sshCredentials.host);
+                formData.append('user', sshCredentials.user);
                 
-                // Get password and privatekey from URL params
-                const params = new URLSearchParams(window.location.search);
-                formData.append('password', params.get('password') || '');
-                formData.append('privatekey', params.get('privatekey') || '');
+                // Use credentials from global storage
+                formData.append('password', sshCredentials.password);
+                formData.append('privatekey', sshCredentials.privatekey);
                 
                 // Use XMLHttpRequest for progress tracking
                 const xhr = new XMLHttpRequest();
@@ -534,6 +531,9 @@
                 user = templateUser;
                 privatekey = templatePrivateKey;
             }
+            
+            // Store credentials globally for download/upload
+            sshCredentials = { host: host, user: user, password: password, privatekey: privatekey };
             
             if (host && user) {
                 // Update window title
