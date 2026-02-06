@@ -442,9 +442,27 @@ func downloadFileViaSSH(w http.ResponseWriter, remotePath, host, user, password 
 	// Extract filename from path
 	filename := filepath.Base(remotePath)
 
+	// Get file size first using stat command
+	statSession, err := sshConn.NewSession()
+	if err != nil {
+		return "", fmt.Errorf("failed to create stat session: %v", err)
+	}
+	statOutput, err := statSession.CombinedOutput(fmt.Sprintf("stat -c %%s '%s'", remotePath))
+	statSession.Close()
+	if err != nil {
+		return "", fmt.Errorf("failed to get file size: %v", err)
+	}
+
+	// Parse file size
+	var fileSize int64
+	if _, err := fmt.Sscanf(string(statOutput), "%d", &fileSize); err != nil {
+		return "", fmt.Errorf("failed to parse file size: %v", err)
+	}
+
 	// Set response headers before starting the stream
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", filename))
 	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", fileSize))
 
 	// Use cat to read the file - properly quote the filename
 	if err := downloadSession.Start(fmt.Sprintf("cat '%s'", remotePath)); err != nil {
