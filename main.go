@@ -246,16 +246,12 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Stream file from SSH server directly to response
-	filename, err := downloadFileViaSSH(w, remotePath, host, user, password, privateKey)
+	_, err = downloadFileViaSSH(w, remotePath, host, user, password, privateKey)
 	if err != nil {
 		log.Printf("Download failed: %v", err)
 		http.Error(w, "Download failed: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-
-	// Set headers for file download
-	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", filename))
-	w.Header().Set("Content-Type", "application/octet-stream")
 }
 
 func decryptAccess(encrypted string) (SSHCredentials, error) {
