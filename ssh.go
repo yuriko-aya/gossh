@@ -9,6 +9,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"path/filepath"
+	"strings"
 
 	"github.com/gorilla/websocket"
 	"golang.org/x/crypto/ssh"
@@ -374,6 +375,80 @@ func uploadFileViaSSH(file multipart.File, filename, host, user, password string
 	return remotePath, nil
 }
 
+func validateFileViaSSH(remotePath, host, user, password string, privateKey []byte) (map[string]interface{}, error) {
+	// Validate remote path - only allow downloads from /home, /opt, and /tmp
+	allowedPaths := []string{"/home/", "/opt/", "/tmp/"}
+	isAllowed := false
+	for _, prefix := range allowedPaths {
+		if len(remotePath) >= len(prefix) && remotePath[:len(prefix)] == prefix {
+			isAllowed = true
+			break
+		}
+	}
+	if !isAllowed {
+		return nil, fmt.Errorf("access denied: downloads are only allowed from /home, /opt, and /tmp directories")
+	}
+
+	// Build SSH client configuration
+	config := &ssh.ClientConfig{
+		User:            user,
+		Auth:            []ssh.AuthMethod{},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+	}
+
+	// Add authentication methods
+	if password != "" {
+		config.Auth = append(config.Auth, ssh.Password(password))
+	}
+
+	if len(privateKey) > 0 {
+		signer, err := ssh.ParsePrivateKey(privateKey)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse private key: %v", err)
+		}
+		config.Auth = append(config.Auth, ssh.PublicKeys(signer))
+	}
+
+	// Add default port if not specified
+	if !containsPort(host) {
+		host = host + ":22"
+	}
+
+	// Connect to SSH server
+	sshConn, err := ssh.Dial("tcp", host, config)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to SSH server: %v", err)
+	}
+	defer sshConn.Close()
+
+	// Create a session to check file
+	session, err := sshConn.NewSession()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create session: %v", err)
+	}
+	defer session.Close()
+
+	// Check if file exists and get its size using stat
+	output, err := session.CombinedOutput(fmt.Sprintf("test -f '%s' && stat -c '%%s' '%s' || echo 'NOT_FOUND'", remotePath, remotePath))
+	if err != nil || strings.TrimSpace(string(output)) == "NOT_FOUND" {
+		return nil, fmt.Errorf("file not found or not a regular file: %s", remotePath)
+	}
+
+	// Parse file size
+	var fileSize int64
+	if _, err := fmt.Sscanf(string(output), "%d", &fileSize); err != nil {
+		return nil, fmt.Errorf("failed to get file information: %v", err)
+	}
+
+	// Extract filename from path
+	filename := filepath.Base(remotePath)
+
+	return map[string]interface{}{
+		"filename": filename,
+		"size":     fileSize,
+	}, nil
+}
+
 func downloadFileViaSSH(w http.ResponseWriter, remotePath, host, user, password string, privateKey []byte) (string, error) {
 	// Validate remote path - only allow downloads from /home, /opt, and /tmp
 	allowedPaths := []string{"/home/", "/opt/", "/tmp/"}
@@ -459,15 +534,16 @@ func downloadFileViaSSH(w http.ResponseWriter, remotePath, host, user, password 
 		return "", fmt.Errorf("failed to parse file size: %v", err)
 	}
 
-	// Set response headers before starting the stream
-	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", filename))
-	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Header().Set("Content-Length", fmt.Sprintf("%d", fileSize))
-
-	// Use cat to read the file - properly quote the filename
+	// Start the cat command - do this before setting headers
+	// so if it fails, we can still return a proper HTTP error
 	if err := downloadSession.Start(fmt.Sprintf("cat '%s'", remotePath)); err != nil {
 		return "", fmt.Errorf("failed to start download command: %v", err)
 	}
+
+	// Now set response headers - after this point, we're committed to streaming
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", filename))
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", fileSize))
 
 	// Stream file content directly to HTTP response writer
 	// This avoids loading the entire file into memory

@@ -217,7 +217,7 @@
         let term;
         let socket;
         let fitAddon;
-        let sshCredentials = { host: '', user: '', password: '', privatekey: '' };
+        let sshCredentials = { host: '', user: '', password: '', privatekey: '', access: '' };
 
         function updateStatus(message, type) {
             const statusEl = document.getElementById('status');
@@ -225,42 +225,85 @@
             statusEl.style.color = type === 'success' ? '#98c379' : type === 'error' ? '#e06c75' : '#ffffff';
         }
         
-        function handleFileDownload(host, user) {
+        async function handleFileDownload(host, user) {
             const remotePath = prompt('Enter remote file path to download (e.g., /tmp/myfile.txt):');
             if (!remotePath || remotePath.trim() === '') return;
             
             const downloadBtn = document.getElementById('downloadBtn');
             downloadBtn.disabled = true;
-            downloadBtn.textContent = 'Downloading...';
+            downloadBtn.textContent = 'Validating...';
             
-            term.write(`\r\n\x1b[1;36mDownloading ${remotePath}...\x1b[0m\r\n`);
+            term.write(`\r\n\x1b[1;36mValidating ${remotePath}...\x1b[0m\r\n`);
             
-            // Build download URL with credentials from global storage
-            const downloadUrl = new URL('/download', window.location.origin);
-            downloadUrl.searchParams.set('host', sshCredentials.host);
-            downloadUrl.searchParams.set('user', sshCredentials.user);
-            downloadUrl.searchParams.set('password', sshCredentials.password);
-            downloadUrl.searchParams.set('privatekey', sshCredentials.privatekey);
-            downloadUrl.searchParams.set('path', remotePath);
+            // Build validate URL
+            const validateUrl = new URL('/validate-download', window.location.origin);
             
-            // Create invisible iframe to trigger download
-            const iframe = document.createElement('iframe');
-            iframe.style.display = 'none';
-            iframe.src = downloadUrl.toString();
-            document.body.appendChild(iframe);
+            // Use access token if available, otherwise use individual credentials
+            if (sshCredentials.access) {
+                validateUrl.searchParams.set('access', sshCredentials.access);
+            } else {
+                validateUrl.searchParams.set('host', sshCredentials.host);
+                validateUrl.searchParams.set('user', sshCredentials.user);
+                validateUrl.searchParams.set('password', sshCredentials.password);
+                validateUrl.searchParams.set('privatekey', sshCredentials.privatekey);
+            }
+            validateUrl.searchParams.set('path', remotePath);
             
-            // Check if download succeeded
-            setTimeout(() => {
-                term.write(`\r\n\x1b[1;32mDownload started. Check your browser downloads.\x1b[0m\r\n`);
-                downloadBtn.disabled = false;
-                downloadBtn.textContent = 'Download File';
-                document.body.removeChild(iframe);
+            try {
+                // Validate the file first
+                const validateResponse = await fetch(validateUrl.toString());
+                const validateData = await validateResponse.json();
                 
-                // Send enter to show prompt
-                if (socket && socket.readyState === WebSocket.OPEN) {
-                    socket.send(JSON.stringify({ type: 'input', data: '\r' }));
+                if (!validateData.valid) {
+                    throw new Error(validateData.error);
                 }
-            }, 1000);
+                
+                // Show file info
+                const sizeMB = (validateData.size / 1024 / 1024).toFixed(2);
+                term.write(`\r\n\x1b[1;32mFile found: ${validateData.filename} (${sizeMB} MB)\x1b[0m\r\n`);
+                term.write(`\r\n\x1b[1;36mStarting download...\x1b[0m\r\n`);
+                
+                downloadBtn.textContent = 'Downloading...';
+                
+                // Build download URL
+                const downloadUrl = new URL('/download', window.location.origin);
+                
+                // Use access token if available, otherwise use individual credentials
+                if (sshCredentials.access) {
+                    downloadUrl.searchParams.set('access', sshCredentials.access);
+                } else {
+                    downloadUrl.searchParams.set('host', sshCredentials.host);
+                    downloadUrl.searchParams.set('user', sshCredentials.user);
+                    downloadUrl.searchParams.set('password', sshCredentials.password);
+                    downloadUrl.searchParams.set('privatekey', sshCredentials.privatekey);
+                }
+                downloadUrl.searchParams.set('path', remotePath);
+                
+                // Create anchor element and trigger download
+                const a = document.createElement('a');
+                a.href = downloadUrl.toString();
+                a.download = '';  // Triggers download instead of navigation
+                a.style.display = 'none';
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                
+                term.write(`\r\n\x1b[1;32mDownload started. Check your browser downloads.\x1b[0m\r\n`);
+                
+            } catch (error) {
+                term.write(`\r\n\x1b[1;31mValidation failed: ${error.message}\x1b[0m\r\n`);
+            } finally {
+                // Re-enable button after a short delay
+                setTimeout(() => {
+                    downloadBtn.disabled = false;
+                    downloadBtn.textContent = 'Download File';
+                    
+                    // Send enter to show prompt
+                    if (socket && socket.readyState === WebSocket.OPEN) {
+                        socket.send(JSON.stringify({ type: 'input', data: '\r' }));
+                    }
+                }, 1000);
+            }
         }
         
         function handleFileUpload(host, user) {
@@ -300,12 +343,16 @@
                 // Use FormData for proper file upload
                 const formData = new FormData();
                 formData.append('file', file);
-                formData.append('host', sshCredentials.host);
-                formData.append('user', sshCredentials.user);
                 
-                // Use credentials from global storage
-                formData.append('password', sshCredentials.password);
-                formData.append('privatekey', sshCredentials.privatekey);
+                // Use access token if available, otherwise use individual credentials
+                if (sshCredentials.access) {
+                    formData.append('access', sshCredentials.access);
+                } else {
+                    formData.append('host', sshCredentials.host);
+                    formData.append('user', sshCredentials.user);
+                    formData.append('password', sshCredentials.password);
+                    formData.append('privatekey', sshCredentials.privatekey);
+                }
                 
                 // Use XMLHttpRequest for progress tracking
                 const xhr = new XMLHttpRequest();
@@ -433,7 +480,14 @@
 
             // Build WebSocket URL
             const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-            const wsUrl = `${protocol}//${window.location.host}/ws?host=${encodeURIComponent(host)}&user=${encodeURIComponent(user)}&password=${encodeURIComponent(password)}&privatekey=${encodeURIComponent(privatekey)}`;
+            let wsUrl;
+            
+            // Use access token if available, otherwise use individual credentials
+            if (sshCredentials.access) {
+                wsUrl = `${protocol}//${window.location.host}/ws?access=${encodeURIComponent(sshCredentials.access)}`;
+            } else {
+                wsUrl = `${protocol}//${window.location.host}/ws?host=${encodeURIComponent(host)}&user=${encodeURIComponent(user)}&password=${encodeURIComponent(password)}&privatekey=${encodeURIComponent(privatekey)}`;
+            }
 
             // Connect to WebSocket
             socket = new WebSocket(wsUrl);
@@ -519,21 +573,24 @@
             let user = params.get('user');
             let password = params.get('password') || '';
             let privatekey = params.get('privatekey') || '';
+            let access = params.get('access') || '';
             
             // Check if credentials are in template (from access token)
             const templateHost = '{{.Host}}';
             const templateUser = '{{.User}}';
             const templatePrivateKey = '{{.PrivateKey}}';
+            const templateAccessToken = '{{.AccessToken}}';
             
             // Use template credentials if available (access token mode)
             if (templateHost && templateUser) {
                 host = templateHost;
                 user = templateUser;
                 privatekey = templatePrivateKey;
+                access = templateAccessToken;
             }
             
             // Store credentials globally for download/upload
-            sshCredentials = { host: host, user: user, password: password, privatekey: privatekey };
+            sshCredentials = { host: host, user: user, password: password, privatekey: privatekey, access: access };
             
             if (host && user) {
                 // Update window title

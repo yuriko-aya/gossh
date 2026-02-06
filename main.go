@@ -40,10 +40,11 @@ var (
 )
 
 type SSHCredentials struct {
-	Host       string
-	User       string
-	Password   string
-	PrivateKey string
+	Host        string
+	User        string
+	Password    string
+	PrivateKey  string
+	AccessToken string
 }
 
 func init() {
@@ -92,6 +93,7 @@ func main() {
 	http.HandleFunc("/terminal", terminalHandler)
 	http.HandleFunc("/upload", uploadHandler)
 	http.HandleFunc("/download", downloadHandler)
+	http.HandleFunc("/validate-download", validateDownloadHandler)
 	http.HandleFunc("/ws", wsHandler)
 	http.HandleFunc("/static/", noCacheStaticHandler)
 
@@ -122,6 +124,9 @@ func indexHandler(w http.ResponseWriter, r *http.Request) {
 			log.Printf("Failed to decrypt access token: %v", err)
 			return
 		}
+
+		// Store the access token for use in WebSocket/download/upload
+		creds.AccessToken = accessParam
 
 		// Direct access mode - render terminal page directly
 		if tmpl != nil {
@@ -169,21 +174,43 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
-	// Get SSH credentials from form
-	host := r.FormValue("host")
-	user := r.FormValue("user")
-	password := r.FormValue("password")
-	privateKeyB64 := r.FormValue("privatekey")
-
+	// Check if using access token
+	accessParam := r.FormValue("access")
+	var host, user, password string
 	var privateKey []byte
-	if privateKeyB64 != "" {
-		privateKey, err = base64.StdEncoding.DecodeString(privateKeyB64)
+
+	if accessParam != "" {
+		// Decrypt access token to get credentials
+		creds, err := decryptAccess(accessParam)
 		if err != nil {
 			respondJSON(w, map[string]interface{}{
 				"success": false,
-				"error":   "Invalid private key encoding",
+				"error":   "Invalid access token",
 			})
 			return
+		}
+		host = creds.Host
+		user = creds.User
+		password = creds.Password
+		if creds.PrivateKey != "" {
+			privateKey, _ = base64.StdEncoding.DecodeString(creds.PrivateKey)
+		}
+	} else {
+		// Get SSH credentials from form (legacy mode)
+		host = r.FormValue("host")
+		user = r.FormValue("user")
+		password = r.FormValue("password")
+		privateKeyB64 := r.FormValue("privatekey")
+
+		if privateKeyB64 != "" {
+			privateKey, err = base64.StdEncoding.DecodeString(privateKeyB64)
+			if err != nil {
+				respondJSON(w, map[string]interface{}{
+					"success": false,
+					"error":   "Invalid private key encoding",
+				})
+				return
+			}
 		}
 	}
 
@@ -208,16 +235,55 @@ func respondJSON(w http.ResponseWriter, data map[string]interface{}) {
 	json.NewEncoder(w).Encode(data)
 }
 
-func downloadHandler(w http.ResponseWriter, r *http.Request) {
-	// Get parameters from query string
-	host := r.URL.Query().Get("host")
-	user := r.URL.Query().Get("user")
-	password := r.URL.Query().Get("password")
-	privateKeyB64 := r.URL.Query().Get("privatekey")
+func validateDownloadHandler(w http.ResponseWriter, r *http.Request) {
+	// Check if using access token
+	accessParam := r.URL.Query().Get("access")
 	remotePath := r.URL.Query().Get("path")
 
+	var host, user, password string
+	var privateKey []byte
+	var err error
+
+	if accessParam != "" {
+		// Decrypt access token to get credentials
+		creds, err := decryptAccess(accessParam)
+		if err != nil {
+			respondJSON(w, map[string]interface{}{
+				"valid": false,
+				"error": "Invalid access token",
+			})
+			return
+		}
+		host = creds.Host
+		user = creds.User
+		password = creds.Password
+		if creds.PrivateKey != "" {
+			privateKey, _ = base64.StdEncoding.DecodeString(creds.PrivateKey)
+		}
+	} else {
+		// Get parameters from query string (legacy mode)
+		host = r.URL.Query().Get("host")
+		user = r.URL.Query().Get("user")
+		password = r.URL.Query().Get("password")
+		privateKeyB64 := r.URL.Query().Get("privatekey")
+
+		if privateKeyB64 != "" {
+			privateKey, err = base64.StdEncoding.DecodeString(privateKeyB64)
+			if err != nil {
+				respondJSON(w, map[string]interface{}{
+					"valid": false,
+					"error": "Invalid private key encoding",
+				})
+				return
+			}
+		}
+	}
+
 	if host == "" || user == "" || remotePath == "" {
-		http.Error(w, "Missing required parameters", http.StatusBadRequest)
+		respondJSON(w, map[string]interface{}{
+			"valid": false,
+			"error": "Missing required parameters",
+		})
 		return
 	}
 
@@ -231,18 +297,72 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if !isAllowed {
-		http.Error(w, "Access denied: Downloads are only allowed from /home, /opt, and /tmp directories", http.StatusForbidden)
+		respondJSON(w, map[string]interface{}{
+			"valid": false,
+			"error": "Access denied: Downloads are only allowed from /home, /opt, and /tmp directories",
+		})
 		return
 	}
 
+	// Check if file exists via SSH
+	fileInfo, err := validateFileViaSSH(remotePath, host, user, password, privateKey)
+	if err != nil {
+		respondJSON(w, map[string]interface{}{
+			"valid": false,
+			"error": err.Error(),
+		})
+		return
+	}
+
+	respondJSON(w, map[string]interface{}{
+		"valid":    true,
+		"filename": fileInfo["filename"],
+		"size":     fileInfo["size"],
+	})
+}
+
+func downloadHandler(w http.ResponseWriter, r *http.Request) {
+	// Check if using access token
+	accessParam := r.URL.Query().Get("access")
+	remotePath := r.URL.Query().Get("path")
+
+	var host, user, password string
 	var privateKey []byte
 	var err error
-	if privateKeyB64 != "" {
-		privateKey, err = base64.StdEncoding.DecodeString(privateKeyB64)
+
+	if accessParam != "" {
+		// Decrypt access token to get credentials
+		creds, err := decryptAccess(accessParam)
 		if err != nil {
-			http.Error(w, "Invalid private key encoding", http.StatusBadRequest)
+			http.Error(w, "Invalid access token", http.StatusBadRequest)
+			log.Printf("Failed to decrypt access token: %v", err)
 			return
 		}
+		host = creds.Host
+		user = creds.User
+		password = creds.Password
+		if creds.PrivateKey != "" {
+			privateKey, _ = base64.StdEncoding.DecodeString(creds.PrivateKey)
+		}
+	} else {
+		// Get parameters from query string (legacy mode)
+		host = r.URL.Query().Get("host")
+		user = r.URL.Query().Get("user")
+		password = r.URL.Query().Get("password")
+		privateKeyB64 := r.URL.Query().Get("privatekey")
+
+		if privateKeyB64 != "" {
+			privateKey, err = base64.StdEncoding.DecodeString(privateKeyB64)
+			if err != nil {
+				http.Error(w, "Invalid private key encoding", http.StatusBadRequest)
+				return
+			}
+		}
+	}
+
+	if host == "" || user == "" || remotePath == "" {
+		http.Error(w, "Missing required parameters", http.StatusBadRequest)
+		return
 	}
 
 	// Stream file from SSH server directly to response
@@ -304,6 +424,26 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer conn.Close()
+
+	// Check if using access token
+	accessParam := r.URL.Query().Get("access")
+	if accessParam != "" {
+		// Decrypt access token to get credentials
+		creds, err := decryptAccess(accessParam)
+		if err != nil {
+			log.Printf("Failed to decrypt access token: %v", err)
+			conn.WriteMessage(websocket.TextMessage, []byte("Error: Invalid access token"))
+			return
+		}
+
+		// Handle SSH connection with decrypted credentials
+		var privateKey []byte
+		if creds.PrivateKey != "" {
+			privateKey, _ = base64.StdEncoding.DecodeString(creds.PrivateKey)
+		}
+		handleSSHConnection(conn, creds.Host, creds.User, creds.Password, privateKey)
+		return
+	}
 
 	// Get credentials from query params or initial message
 	host := r.URL.Query().Get("host")
