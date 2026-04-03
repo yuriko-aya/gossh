@@ -493,9 +493,19 @@
             socket = new WebSocket(wsUrl);
             socket.binaryType = 'arraybuffer'; // Handle binary data as ArrayBuffer for better performance
 
+            // Heartbeat to prevent Cloudflare/browser idle disconnection
+            let heartbeatInterval = null;
+
             socket.onopen = function() {
                 updateStatus(`Connected to ${user}@${host}`, 'success');
                 
+                // Start heartbeat every 10 seconds
+                heartbeatInterval = setInterval(function() {
+                    if (socket && socket.readyState === WebSocket.OPEN) {
+                        socket.send(JSON.stringify({ type: 'ping' }));
+                    }
+                }, 10000);
+
                 // Hide loading overlay
                 const loadingOverlay = document.getElementById('loadingOverlay');
                 loadingOverlay.classList.add('hidden');
@@ -546,6 +556,7 @@
             };
 
             socket.onclose = function() {
+                clearInterval(heartbeatInterval);
                 updateStatus(`Disconnected from ${user}@${host}`, 'error');
                 term.write('\r\n\x1b[1;33mConnection closed\x1b[0m\r\n');
                 

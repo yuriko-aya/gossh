@@ -170,6 +170,8 @@ func handleSSHConnection(wsConn *websocket.Conn, host, user, password string, pr
 			}
 
 			switch msg.Type {
+			case "ping":
+				// Heartbeat from client — silently ignored
 			case "input":
 				// Write user input to SSH stdin
 				if _, err := stdin.Write([]byte(msg.Data)); err != nil {
