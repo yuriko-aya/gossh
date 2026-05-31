@@ -18,34 +18,48 @@ document.addEventListener('DOMContentLoaded', function() {
         let privateKeyBase64 = '';
         
         if (privateKeyFile) {
-            // Read private key file and convert to base64
-            const reader = new FileReader();
-            reader.onload = function(event) {
-                const privateKeyContent = event.target.result;
-                privateKeyBase64 = btoa(privateKeyContent);
-                
-                // Open terminal in a full-screen popup window
-                openTerminalPopup(host, user, password, privateKeyBase64);
-            };
-            reader.readAsText(privateKeyFile);
-        } else {
-            // Open terminal in a full-screen popup window
-            openTerminalPopup(host, user, password, privateKeyBase64);
+            privateKeyBase64 = await new Promise((resolve) => {
+                const reader = new FileReader();
+                reader.onload = function(event) {
+                    resolve(btoa(event.target.result));
+                };
+                reader.readAsText(privateKeyFile);
+            });
         }
+        
+        await openTerminalPopup(host, user, password, privateKeyBase64);
     });
 });
 
-function openTerminalPopup(host, user, password, privatekey) {
-    const params = new URLSearchParams({
-        host: host,
-        user: user,
-        password: password,
-        privatekey: privatekey
-    });
-    
+async function openTerminalPopup(host, user, password, privatekey) {
+    // Exchange credentials for a server-issued access token so that
+    // sensitive values never appear in plain text in any URL.
+    let accessToken;
+    try {
+        const body = new URLSearchParams({ host, user, password, privatekey });
+        const response = await fetch('/connect', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: body.toString()
+        });
+        if (!response.ok) {
+            alert('Connection failed: server returned ' + response.status);
+            return;
+        }
+        const data = await response.json();
+        if (!data.access) {
+            alert('Connection failed: no access token returned.');
+            return;
+        }
+        accessToken = data.access;
+    } catch (err) {
+        alert('Connection failed: ' + err.message);
+        return;
+    }
+
     // Open popup window with 960x640 size
     const popup = window.open(
-        `/terminal?${params.toString()}`,
+        `/terminal?access=${encodeURIComponent(accessToken)}`,
         'SSH Terminal',
         'width=960,height=640,location=no,menubar=no,toolbar=no,status=no,resizable=yes'
     );

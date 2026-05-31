@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/gorilla/websocket"
 	"golang.org/x/crypto/ssh"
@@ -22,6 +23,8 @@ type WSMessage struct {
 	Rows     int    `json:"rows"`
 	Filename string `json:"filename"`
 	Size     int64  `json:"size"`
+	Key      string `json:"key"`  // S3 object key for s3_pull
+	Dest     string `json:"dest"` // remote destination path for s3_pull
 }
 
 type UploadResponse struct {
@@ -186,6 +189,9 @@ func handleSSHConnection(wsConn *websocket.Conn, host, user, password string, pr
 			case "upload":
 				// Handle file upload
 				go handleFileUpload(wsConn, sshConn, msg)
+			case "s3_pull":
+				// Pull a file from S3 presigned URL onto the remote host
+				go handleS3Pull(wsConn, sshConn, msg)
 			}
 		}
 	}()
@@ -300,6 +306,63 @@ func sendUploadResponse(wsConn *websocket.Conn, response UploadResponse) {
 	if err := wsConn.WriteMessage(websocket.TextMessage, data); err != nil {
 		log.Printf("Failed to send upload response: %v", err)
 	}
+}
+
+// handleS3Pull generates a presigned GET URL for the uploaded S3 object and
+// uses wget over SSH to pull it onto the remote host.
+func handleS3Pull(wsConn *websocket.Conn, sshConn *ssh.Client, msg WSMessage) {
+	var response UploadResponse
+	response.Type = "s3_pull_response"
+
+	// Constrain destination to /tmp/ to prevent path traversal
+	dest := filepath.Clean(msg.Dest)
+	if !strings.HasPrefix(dest, "/tmp/") {
+		response.Success = false
+		response.Error = "destination must be within /tmp/"
+		sendUploadResponse(wsConn, response)
+		return
+	}
+
+	// Generate a short-lived presigned GET URL — used immediately by wget
+	getURL, err := presignGetURL(msg.Key, 5*time.Minute)
+	if err != nil {
+		response.Success = false
+		response.Error = fmt.Sprintf("failed to generate download URL: %v", err)
+		sendUploadResponse(wsConn, response)
+		return
+	}
+
+	pullSession, err := sshConn.NewSession()
+	if err != nil {
+		response.Success = false
+		response.Error = fmt.Sprintf("failed to create pull session: %v", err)
+		sendUploadResponse(wsConn, response)
+		return
+	}
+	defer pullSession.Close()
+
+	stderrPipe, err := pullSession.StderrPipe()
+	if err != nil {
+		response.Success = false
+		response.Error = fmt.Sprintf("failed to get stderr pipe: %v", err)
+		sendUploadResponse(wsConn, response)
+		return
+	}
+
+	// Single-quoted strings are safe: S3 presigned URLs and /tmp/ paths
+	// never contain single quotes.
+	cmd := fmt.Sprintf("wget -q -O '%s' '%s'", dest, getURL)
+	if err := pullSession.Run(cmd); err != nil {
+		stderrData, _ := io.ReadAll(stderrPipe)
+		response.Success = false
+		response.Error = fmt.Sprintf("wget failed: %v - %s", err, string(stderrData))
+		sendUploadResponse(wsConn, response)
+		return
+	}
+
+	response.Success = true
+	response.Path = dest
+	sendUploadResponse(wsConn, response)
 }
 
 func uploadFileViaSSH(file multipart.File, filename, host, user, password string, privateKey []byte) (string, error) {

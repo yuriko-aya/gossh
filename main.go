@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -10,7 +11,9 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/fernet/fernet-go"
 	"github.com/gorilla/websocket"
@@ -25,6 +28,12 @@ type Config struct {
 	Security struct {
 		FernetKey string `yaml:"fernet_key"`
 	} `yaml:"security"`
+	S3 struct {
+		Region          string `yaml:"region"`
+		Bucket          string `yaml:"bucket"`
+		AccessKeyID     string `yaml:"access_key_id"`
+		SecretAccessKey string `yaml:"secret_access_key"`
+	} `yaml:"s3"`
 }
 
 var (
@@ -32,7 +41,15 @@ var (
 		ReadBufferSize:  1024,
 		WriteBufferSize: 1024,
 		CheckOrigin: func(r *http.Request) bool {
-			return true
+			origin := r.Header.Get("Origin")
+			if origin == "" {
+				return true
+			}
+			u, err := url.Parse(origin)
+			if err != nil {
+				return false
+			}
+			return u.Host == r.Host
 		},
 	}
 	tmpl   *template.Template
@@ -92,8 +109,10 @@ func main() {
 	http.HandleFunc("/", indexHandler)
 	http.HandleFunc("/terminal", terminalHandler)
 	http.HandleFunc("/upload", uploadHandler)
+	http.HandleFunc("/presign", presignHandler)
 	http.HandleFunc("/download", downloadHandler)
 	http.HandleFunc("/validate-download", validateDownloadHandler)
+	http.HandleFunc("/connect", connectHandler)
 	http.HandleFunc("/ws", wsHandler)
 	http.HandleFunc("/static/", noCacheStaticHandler)
 
@@ -146,9 +165,20 @@ func indexHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func terminalHandler(w http.ResponseWriter, r *http.Request) {
-	// Render the terminal popup page
+	accessParam := r.URL.Query().Get("access")
+	var creds SSHCredentials
+	if accessParam != "" {
+		var err error
+		creds, err = decryptAccess(accessParam)
+		if err != nil {
+			http.Error(w, "Invalid access token", http.StatusBadRequest)
+			log.Printf("Failed to decrypt access token in terminalHandler: %v", err)
+			return
+		}
+		creds.AccessToken = accessParam
+	}
 	if tmpl != nil {
-		tmpl.ExecuteTemplate(w, "terminal.html", nil)
+		tmpl.ExecuteTemplate(w, "terminal.html", creds)
 	} else {
 		http.Error(w, "Templates not loaded", http.StatusInternalServerError)
 	}
@@ -196,22 +226,11 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 			privateKey, _ = base64.StdEncoding.DecodeString(creds.PrivateKey)
 		}
 	} else {
-		// Get SSH credentials from form (legacy mode)
-		host = r.FormValue("host")
-		user = r.FormValue("user")
-		password = r.FormValue("password")
-		privateKeyB64 := r.FormValue("privatekey")
-
-		if privateKeyB64 != "" {
-			privateKey, err = base64.StdEncoding.DecodeString(privateKeyB64)
-			if err != nil {
-				respondJSON(w, map[string]interface{}{
-					"success": false,
-					"error":   "Invalid private key encoding",
-				})
-				return
-			}
-		}
+		respondJSON(w, map[string]interface{}{
+			"success": false,
+			"error":   "access token required",
+		})
+		return
 	}
 
 	// Upload file via SSH
@@ -233,6 +252,44 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 func respondJSON(w http.ResponseWriter, data map[string]interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(data)
+}
+
+func presignHandler(w http.ResponseWriter, r *http.Request) {
+	// Require a valid access token — confirms the caller has an active SSH session
+	accessParam := r.URL.Query().Get("access")
+	if accessParam == "" {
+		http.Error(w, "access token required", http.StatusBadRequest)
+		return
+	}
+	if _, err := decryptAccess(accessParam); err != nil {
+		http.Error(w, "Invalid access token", http.StatusUnauthorized)
+		return
+	}
+
+	filename := filepath.Base(r.URL.Query().Get("filename"))
+	if filename == "" || filename == "." {
+		http.Error(w, "filename required", http.StatusBadRequest)
+		return
+	}
+
+	// Generate a random prefix so keys never collide and can't be guessed
+	randBytes := make([]byte, 8)
+	if _, err := rand.Read(randBytes); err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	objectKey := fmt.Sprintf("uploads/%x/%s", randBytes, filename)
+
+	uploadURL, err := presignPutURL(objectKey, 15*time.Minute)
+	if err != nil {
+		respondJSON(w, map[string]interface{}{"success": false, "error": err.Error()})
+		return
+	}
+
+	respondJSON(w, map[string]interface{}{
+		"upload_url": uploadURL,
+		"object_key": objectKey,
+	})
 }
 
 func validateDownloadHandler(w http.ResponseWriter, r *http.Request) {
@@ -261,22 +318,11 @@ func validateDownloadHandler(w http.ResponseWriter, r *http.Request) {
 			privateKey, _ = base64.StdEncoding.DecodeString(creds.PrivateKey)
 		}
 	} else {
-		// Get parameters from query string (legacy mode)
-		host = r.URL.Query().Get("host")
-		user = r.URL.Query().Get("user")
-		password = r.URL.Query().Get("password")
-		privateKeyB64 := r.URL.Query().Get("privatekey")
-
-		if privateKeyB64 != "" {
-			privateKey, err = base64.StdEncoding.DecodeString(privateKeyB64)
-			if err != nil {
-				respondJSON(w, map[string]interface{}{
-					"valid": false,
-					"error": "Invalid private key encoding",
-				})
-				return
-			}
-		}
+		respondJSON(w, map[string]interface{}{
+			"valid": false,
+			"error": "access token required",
+		})
+		return
 	}
 
 	if host == "" || user == "" || remotePath == "" {
@@ -345,19 +391,8 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 			privateKey, _ = base64.StdEncoding.DecodeString(creds.PrivateKey)
 		}
 	} else {
-		// Get parameters from query string (legacy mode)
-		host = r.URL.Query().Get("host")
-		user = r.URL.Query().Get("user")
-		password = r.URL.Query().Get("password")
-		privateKeyB64 := r.URL.Query().Get("privatekey")
-
-		if privateKeyB64 != "" {
-			privateKey, err = base64.StdEncoding.DecodeString(privateKeyB64)
-			if err != nil {
-				http.Error(w, "Invalid private key encoding", http.StatusBadRequest)
-				return
-			}
-		}
+		http.Error(w, "access token required", http.StatusBadRequest)
+		return
 	}
 
 	if host == "" || user == "" || remotePath == "" {
@@ -407,6 +442,7 @@ func decryptAccess(encrypted string) (SSHCredentials, error) {
 
 	creds.User = values.Get("username")
 	creds.Host = values.Get("hostname")
+	creds.Password = values.Get("password")
 	creds.PrivateKey = values.Get("privatekey")
 
 	return creds, nil
@@ -417,6 +453,68 @@ func getDefaultFernetKey() string {
 	return config.Security.FernetKey
 }
 
+func encryptAccess(creds SSHCredentials) (string, error) {
+	fernetKey := getDefaultFernetKey()
+	if fernetKey == "" {
+		return "", fmt.Errorf("fernet key not configured")
+	}
+	keys, err := fernet.DecodeKeys(fernetKey)
+	if err != nil {
+		return "", fmt.Errorf("invalid fernet key: %v", err)
+	}
+
+	values := url.Values{}
+	values.Set("username", creds.User)
+	values.Set("hostname", creds.Host)
+	if creds.Password != "" {
+		values.Set("password", creds.Password)
+	}
+	if creds.PrivateKey != "" {
+		values.Set("privatekey", creds.PrivateKey)
+	}
+
+	dataB64 := base64.StdEncoding.EncodeToString([]byte(values.Encode()))
+	tok, err := fernet.EncryptAndSign([]byte(dataB64), keys[0])
+	if err != nil {
+		return "", fmt.Errorf("encryption failed: %v", err)
+	}
+	return string(tok), nil
+}
+
+func connectHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		respondJSON(w, map[string]interface{}{"error": "Invalid form data"})
+		return
+	}
+
+	host := r.FormValue("host")
+	user := r.FormValue("user")
+	password := r.FormValue("password")
+	privatekey := r.FormValue("privatekey")
+
+	if host == "" || user == "" {
+		respondJSON(w, map[string]interface{}{"error": "host and user are required"})
+		return
+	}
+
+	token, err := encryptAccess(SSHCredentials{
+		Host:       host,
+		User:       user,
+		Password:   password,
+		PrivateKey: privatekey,
+	})
+	if err != nil {
+		log.Printf("Failed to encrypt credentials: %v", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+	respondJSON(w, map[string]interface{}{"access": token})
+}
+
 func wsHandler(w http.ResponseWriter, r *http.Request) {
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -425,69 +523,22 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer conn.Close()
 
-	// Check if using access token
 	accessParam := r.URL.Query().Get("access")
-	if accessParam != "" {
-		// Decrypt access token to get credentials
-		creds, err := decryptAccess(accessParam)
-		if err != nil {
-			log.Printf("Failed to decrypt access token: %v", err)
-			conn.WriteMessage(websocket.TextMessage, []byte("Error: Invalid access token"))
-			return
-		}
-
-		// Handle SSH connection with decrypted credentials
-		var privateKey []byte
-		if creds.PrivateKey != "" {
-			privateKey, _ = base64.StdEncoding.DecodeString(creds.PrivateKey)
-		}
-		handleSSHConnection(conn, creds.Host, creds.User, creds.Password, privateKey)
+	if accessParam == "" {
+		conn.WriteMessage(websocket.TextMessage, []byte("Error: access token required"))
 		return
 	}
 
-	// Get credentials from query params or initial message
-	host := r.URL.Query().Get("host")
-	user := r.URL.Query().Get("user")
-	password := r.URL.Query().Get("password")
-	privateKeyB64 := r.URL.Query().Get("privatekey")
+	creds, err := decryptAccess(accessParam)
+	if err != nil {
+		log.Printf("Failed to decrypt access token: %v", err)
+		conn.WriteMessage(websocket.TextMessage, []byte("Error: Invalid access token"))
+		return
+	}
 
 	var privateKey []byte
-	if privateKeyB64 != "" {
-		privateKey, err = base64.StdEncoding.DecodeString(privateKeyB64)
-		if err != nil {
-			log.Printf("Failed to decode private key: %v", err)
-			conn.WriteMessage(websocket.TextMessage, []byte("Error: Invalid private key encoding"))
-			return
-		}
+	if creds.PrivateKey != "" {
+		privateKey, _ = base64.StdEncoding.DecodeString(creds.PrivateKey)
 	}
-
-	// If no credentials in query, wait for initial message with credentials
-	if host == "" {
-		_, msg, err := conn.ReadMessage()
-		if err != nil {
-			log.Printf("Failed to read credentials: %v", err)
-			return
-		}
-
-		// Parse credentials from message (format: host|user|password|privatekey_base64)
-		parts := strings.Split(string(msg), "|")
-		if len(parts) >= 2 {
-			host = parts[0]
-			user = parts[1]
-			if len(parts) > 2 {
-				password = parts[2]
-			}
-			if len(parts) > 3 && parts[3] != "" {
-				privateKey, _ = base64.StdEncoding.DecodeString(parts[3])
-			}
-		}
-	}
-
-	if host == "" || user == "" {
-		conn.WriteMessage(websocket.TextMessage, []byte("Error: Missing host or user"))
-		return
-	}
-
-	// Handle SSH connection
-	handleSSHConnection(conn, host, user, password, privateKey)
+	handleSSHConnection(conn, creds.Host, creds.User, creds.Password, privateKey)
 }

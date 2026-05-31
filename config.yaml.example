@@ -5,3 +5,11 @@ server:
 security:
   fernet_key: REPLACE_WITH_YOUR_OWN_KEY
   # Generate with: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+
+s3:
+  region: us-east-1
+  bucket: your-bucket-name
+  access_key_id: YOUR_AWS_ACCESS_KEY_ID
+  secret_access_key: YOUR_AWS_SECRET_ACCESS_KEY
+  # The IAM policy needs: s3:PutObject and s3:GetObject on the bucket/uploads/* prefix.
+  # Add a lifecycle rule to expire objects under uploads/ after 1 day.

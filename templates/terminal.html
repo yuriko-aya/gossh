@@ -238,15 +238,13 @@
             // Build validate URL
             const validateUrl = new URL('/validate-download', window.location.origin);
             
-            // Use access token if available, otherwise use individual credentials
-            if (sshCredentials.access) {
-                validateUrl.searchParams.set('access', sshCredentials.access);
-            } else {
-                validateUrl.searchParams.set('host', sshCredentials.host);
-                validateUrl.searchParams.set('user', sshCredentials.user);
-                validateUrl.searchParams.set('password', sshCredentials.password);
-                validateUrl.searchParams.set('privatekey', sshCredentials.privatekey);
+            if (!sshCredentials.access) {
+                term.write('\r\n\x1b[1;31mError: Cannot download — missing access token. Please reconnect.\x1b[0m\r\n');
+                downloadBtn.disabled = false;
+                downloadBtn.textContent = 'Download File';
+                return;
             }
+            validateUrl.searchParams.set('access', sshCredentials.access);
             validateUrl.searchParams.set('path', remotePath);
             
             try {
@@ -267,16 +265,7 @@
                 
                 // Build download URL
                 const downloadUrl = new URL('/download', window.location.origin);
-                
-                // Use access token if available, otherwise use individual credentials
-                if (sshCredentials.access) {
-                    downloadUrl.searchParams.set('access', sshCredentials.access);
-                } else {
-                    downloadUrl.searchParams.set('host', sshCredentials.host);
-                    downloadUrl.searchParams.set('user', sshCredentials.user);
-                    downloadUrl.searchParams.set('password', sshCredentials.password);
-                    downloadUrl.searchParams.set('privatekey', sshCredentials.privatekey);
-                }
+                downloadUrl.searchParams.set('access', sshCredentials.access);
                 downloadUrl.searchParams.set('path', remotePath);
                 
                 // Create anchor element and trigger download
@@ -312,17 +301,9 @@
             
             fileInput.click();
             
-            fileInput.onchange = function(e) {
+            fileInput.onchange = async function(e) {
                 const file = e.target.files[0];
                 if (!file) return;
-                
-                // Check file size (2GB limit)
-                const maxSize = 2 * 1024 * 1024 * 1024; // 2GB
-                if (file.size > maxSize) {
-                    term.write('\r\n\x1b[1;31mError: File size exceeds 2GB limit\x1b[0m\r\n');
-                    fileInput.value = '';
-                    return;
-                }
                 
                 uploadBtn.disabled = true;
                 uploadBtn.textContent = 'Uploading...';
@@ -340,74 +321,97 @@
                 
                 term.write(`\r\n\x1b[1;36mUploading ${file.name} (${(file.size / 1024 / 1024).toFixed(2)} MB)...\x1b[0m\r\n`);
                 
-                // Use FormData for proper file upload
-                const formData = new FormData();
-                formData.append('file', file);
-                
-                // Use access token if available, otherwise use individual credentials
-                if (sshCredentials.access) {
-                    formData.append('access', sshCredentials.access);
-                } else {
-                    formData.append('host', sshCredentials.host);
-                    formData.append('user', sshCredentials.user);
-                    formData.append('password', sshCredentials.password);
-                    formData.append('privatekey', sshCredentials.privatekey);
-                }
-                
-                // Use XMLHttpRequest for progress tracking
-                const xhr = new XMLHttpRequest();
-                
-                xhr.upload.addEventListener('progress', function(e) {
-                    if (e.lengthComputable) {
-                        const percentComplete = (e.loaded / e.total) * 100;
-                        const mbLoaded = (e.loaded / 1024 / 1024).toFixed(2);
-                        const mbTotal = (e.total / 1024 / 1024).toFixed(2);
-                        
-                        progressFill.style.width = percentComplete + '%';
-                        progressText.textContent = percentComplete.toFixed(0) + '% - ' + mbLoaded + ' MB / ' + mbTotal + ' MB';
-                    }
-                });
-                
-                xhr.addEventListener('load', function() {
-                    if (xhr.status === 200) {
-                        const data = JSON.parse(xhr.responseText);
-                        if (data.success) {
-                            progressText.textContent = '100% - Upload complete!';
-                            term.write(`\r\n\x1b[1;32mFile uploaded successfully to ${data.path}\x1b[0m\r\n`);
-                            
-                            // Send enter key to show shell prompt
-                            setTimeout(() => {
-                                if (socket && socket.readyState === WebSocket.OPEN) {
-                                    socket.send(JSON.stringify({ type: 'input', data: '\r' }));
-                                }
-                            }, 300);
-                        } else {
-                            term.write(`\r\n\x1b[1;31mUpload failed: ${data.error}\x1b[0m\r\n`);
-                        }
-                    } else {
-                        term.write(`\r\n\x1b[1;31mUpload failed: Server error\x1b[0m\r\n`);
-                    }
-                    
-                    // Hide progress after delay
-                    setTimeout(() => {
-                        progressDiv.classList.remove('active');
-                        uploadBtn.disabled = false;
-                        uploadBtn.textContent = 'Upload File';
-                        fileInput.value = '';
-                    }, 2000);
-                });
-                
-                xhr.addEventListener('error', function() {
-                    term.write(`\r\n\x1b[1;31mUpload failed: Network error\x1b[0m\r\n`);
+                if (!sshCredentials.access) {
+                    term.write('\r\n\x1b[1;31mError: Cannot upload — missing access token. Please reconnect.\x1b[0m\r\n');
                     progressDiv.classList.remove('active');
                     uploadBtn.disabled = false;
                     uploadBtn.textContent = 'Upload File';
                     fileInput.value = '';
-                });
+                    return;
+                }
                 
-                xhr.open('POST', '/upload', true);
-                xhr.send(formData);
+                try {
+                    // Step 1: obtain a presigned S3 PUT URL from the server
+                    const presignResp = await fetch(
+                        `/presign?access=${encodeURIComponent(sshCredentials.access)}&filename=${encodeURIComponent(file.name)}`
+                    );
+                    if (!presignResp.ok) {
+                        throw new Error('Failed to get upload URL (HTTP ' + presignResp.status + ')');
+                    }
+                    const presignData = await presignResp.json();
+                    if (presignData.error) throw new Error(presignData.error);
+                    
+                    // Step 2: PUT the file directly to S3 (no gossh server bandwidth)
+                    await new Promise((resolve, reject) => {
+                        const xhr = new XMLHttpRequest();
+                        
+                        xhr.upload.addEventListener('progress', function(e) {
+                            if (e.lengthComputable) {
+                                const pct = (e.loaded / e.total) * 100;
+                                const mbLoaded = (e.loaded / 1024 / 1024).toFixed(2);
+                                const mbTotal  = (e.total  / 1024 / 1024).toFixed(2);
+                                progressFill.style.width = pct + '%';
+                                progressText.textContent = pct.toFixed(0) + '% - ' + mbLoaded + ' MB / ' + mbTotal + ' MB';
+                            }
+                        });
+                        
+                        xhr.addEventListener('load', function() {
+                            if (xhr.status >= 200 && xhr.status < 300) resolve();
+                            else reject(new Error('S3 upload failed with status ' + xhr.status));
+                        });
+                        xhr.addEventListener('error', () => reject(new Error('Network error during S3 upload')));
+                        
+                        xhr.open('PUT', presignData.upload_url, true);
+                        xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+                        xhr.send(file);
+                    });
+                    
+                    progressFill.style.width = '100%';
+                    progressText.textContent = '100% - Pulling to remote server...';
+                    term.write(`\r\n\x1b[1;36mPulling file to remote server...\x1b[0m\r\n`);
+                    
+                    // Step 3: tell gossh to wget the object from S3 onto the remote host
+                    socket.send(JSON.stringify({
+                        type: 's3_pull',
+                        key:  presignData.object_key,
+                        dest: '/tmp/' + file.name
+                    }));
+                    // Result arrives via s3_pull_response in socket.onmessage
+                    
+                } catch (error) {
+                    term.write(`\r\n\x1b[1;31mUpload failed: ${error.message}\x1b[0m\r\n`);
+                    progressDiv.classList.remove('active');
+                    uploadBtn.disabled = false;
+                    uploadBtn.textContent = 'Upload File';
+                    fileInput.value = '';
+                }
             };
+        }
+        
+        function handleS3PullResponse(msg) {
+            const progressDiv  = document.getElementById('uploadProgress');
+            const progressText = document.getElementById('progressText');
+            const uploadBtn    = document.getElementById('uploadBtn');
+            const fileInput    = document.getElementById('fileInput');
+            
+            if (msg.success) {
+                progressText.textContent = '100% - Upload complete!';
+                term.write(`\r\n\x1b[1;32mFile uploaded successfully to ${msg.path}\x1b[0m\r\n`);
+                setTimeout(() => {
+                    if (socket && socket.readyState === WebSocket.OPEN) {
+                        socket.send(JSON.stringify({ type: 'input', data: '\r' }));
+                    }
+                }, 300);
+            } else {
+                term.write(`\r\n\x1b[1;31mUpload failed: ${msg.error}\x1b[0m\r\n`);
+            }
+            
+            setTimeout(() => {
+                progressDiv.classList.remove('active');
+                uploadBtn.disabled = false;
+                uploadBtn.textContent = 'Upload File';
+                fileInput.value = '';
+            }, 2000);
         }
 
         function connectSSH(host, user, password, privatekey) {
@@ -449,7 +453,18 @@
             // Open terminal in the container
             const terminalElement = document.getElementById('terminal');
             term.open(terminalElement);
-            
+
+            // Ctrl+Shift+C: copy terminal selection to clipboard (also blocks DevTools element picker)
+            window.addEventListener('keydown', function(e) {
+                if (e.ctrlKey && e.shiftKey && e.key === 'C') {
+                    e.preventDefault();
+                    const selection = term.getSelection();
+                    if (selection) {
+                        navigator.clipboard.writeText(selection).catch(function() {});
+                    }
+                }
+            }, true);
+
             // Function to properly fit the terminal
             function fitTerminal() {
                 try {
@@ -478,16 +493,14 @@
                 resizeTimeout = setTimeout(fitTerminal, 50);
             });
 
-            // Build WebSocket URL
-            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-            let wsUrl;
-            
-            // Use access token if available, otherwise use individual credentials
-            if (sshCredentials.access) {
-                wsUrl = `${protocol}//${window.location.host}/ws?access=${encodeURIComponent(sshCredentials.access)}`;
-            } else {
-                wsUrl = `${protocol}//${window.location.host}/ws?host=${encodeURIComponent(host)}&user=${encodeURIComponent(user)}&password=${encodeURIComponent(password)}&privatekey=${encodeURIComponent(privatekey)}`;
+            // Build WebSocket URL - requires access token
+            if (!sshCredentials.access) {
+                updateStatus('Error: missing access token', 'error');
+                term.write('\r\n\x1b[1;31mError: No access token. Please reconnect via the main form.\x1b[0m\r\n');
+                return;
             }
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsUrl = `${protocol}//${window.location.host}/ws?access=${encodeURIComponent(sshCredentials.access)}`;
 
             // Connect to WebSocket
             socket = new WebSocket(wsUrl);
@@ -544,6 +557,14 @@
                     const uint8Array = new Uint8Array(event.data);
                     term.write(uint8Array);
                 } else {
+                    // Try to intercept JSON control messages before writing to terminal
+                    try {
+                        const msg = JSON.parse(event.data);
+                        if (msg.type === 's3_pull_response') {
+                            handleS3PullResponse(msg);
+                            return;
+                        }
+                    } catch (e) {}
                     // Fallback for text messages
                     term.write(event.data);
                 }
