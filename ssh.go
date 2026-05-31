@@ -441,8 +441,8 @@ func uploadFileViaSSH(file multipart.File, filename, host, user, password string
 }
 
 func validateFileViaSSH(remotePath, host, user, password string, privateKey []byte) (map[string]interface{}, error) {
-	// Validate remote path - only allow downloads from /home, /opt, and /tmp
-	allowedPaths := []string{"/home/", "/opt/", "/tmp/"}
+	// Validate remote path - only allow downloads from /home, /opt, /tmp, and /var/log
+	allowedPaths := []string{"/home/", "/opt/", "/tmp/", "/var/log/"}
 	isAllowed := false
 	for _, prefix := range allowedPaths {
 		if len(remotePath) >= len(prefix) && remotePath[:len(prefix)] == prefix {
@@ -451,7 +451,7 @@ func validateFileViaSSH(remotePath, host, user, password string, privateKey []by
 		}
 	}
 	if !isAllowed {
-		return nil, fmt.Errorf("access denied: downloads are only allowed from /home, /opt, and /tmp directories")
+		return nil, fmt.Errorf("access denied: downloads are only allowed from /home, /opt, /var/log, and /tmp directories")
 	}
 
 	// Build SSH client configuration
@@ -515,8 +515,8 @@ func validateFileViaSSH(remotePath, host, user, password string, privateKey []by
 }
 
 func downloadFileViaSSH(w http.ResponseWriter, remotePath, host, user, password string, privateKey []byte) (string, error) {
-	// Validate remote path - only allow downloads from /home, /opt, and /tmp
-	allowedPaths := []string{"/home/", "/opt/", "/tmp/"}
+	// Validate remote path - only allow downloads from /home, /opt, /tmp, and /var/log
+	allowedPaths := []string{"/home/", "/opt/", "/tmp/", "/var/log/"}
 	isAllowed := false
 	for _, prefix := range allowedPaths {
 		if len(remotePath) >= len(prefix) && remotePath[:len(prefix)] == prefix {
@@ -525,7 +525,7 @@ func downloadFileViaSSH(w http.ResponseWriter, remotePath, host, user, password 
 		}
 	}
 	if !isAllowed {
-		return "", fmt.Errorf("access denied: downloads are only allowed from /home, /opt, and /tmp directories")
+		return "", fmt.Errorf("access denied: downloads are only allowed from /home, /opt, /var/log, and /tmp directories")
 	}
 
 	// Build SSH client configuration

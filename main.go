@@ -334,7 +334,7 @@ func validateDownloadHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Validate remote path - only allow downloads from /home, /opt, and /tmp
-	allowedPaths := []string{"/home/", "/opt/", "/tmp/"}
+	allowedPaths := []string{"/home/", "/opt/", "/tmp/", "/var/log/"}
 	isAllowed := false
 	for _, prefix := range allowedPaths {
 		if strings.HasPrefix(remotePath, prefix) {
@@ -345,7 +345,7 @@ func validateDownloadHandler(w http.ResponseWriter, r *http.Request) {
 	if !isAllowed {
 		respondJSON(w, map[string]interface{}{
 			"valid": false,
-			"error": "Access denied: Downloads are only allowed from /home, /opt, and /tmp directories",
+			"error": "Access denied: Downloads are only allowed from /home, /opt, /var/log, and /tmp directories",
 		})
 		return
 	}
