@@ -28,16 +28,20 @@ func newSafeWebSocket(conn *websocket.Conn) *safeWebSocket {
 func (s *safeWebSocket) WriteMessage(messageType int, data []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// Clear any short deadline left by ping writes — otherwise stdout/stderr
+	// writes inherit it and fail with "i/o timeout".
+	_ = s.conn.SetWriteDeadline(time.Time{})
 	return s.conn.WriteMessage(messageType, data)
 }
 
 func (s *safeWebSocket) writePing(deadline time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := s.conn.SetWriteDeadline(deadline); err != nil {
-		return err
+	err := s.conn.WriteControl(websocket.PingMessage, nil, deadline)
+	if clearErr := s.conn.SetWriteDeadline(time.Time{}); clearErr != nil && err == nil {
+		return clearErr
 	}
-	return s.conn.WriteControl(websocket.PingMessage, nil, deadline)
+	return err
 }
 
 func (s *safeWebSocket) Close() error {
