@@ -80,7 +80,9 @@ func dialSSH(host, user, password string, privateKey []byte) (*ssh.Client, error
 }
 
 // startSSHKeepalive sends OpenSSH-compatible keepalive requests until stop is closed.
-func startSSHKeepalive(sshConn *ssh.Client, stop <-chan struct{}, onFailed func(reason string)) {
+// Failures are logged but do not tear down the session — many SSH servers do not
+// support keepalive@openssh.com, and TCP keepalive on the dialer still applies.
+func startSSHKeepalive(sshConn *ssh.Client, stop <-chan struct{}) {
 	ticker := time.NewTicker(sshKeepaliveInterval)
 	go func() {
 		defer ticker.Stop()
@@ -89,11 +91,11 @@ func startSSHKeepalive(sshConn *ssh.Client, stop <-chan struct{}, onFailed func(
 			case <-stop:
 				return
 			case <-ticker.C:
-				_, _, err := sshConn.SendRequest("keepalive@openssh.com", true, nil)
+				ok, _, err := sshConn.SendRequest("keepalive@openssh.com", true, nil)
 				if err != nil {
-					log.Printf("SSH keepalive failed: %v", err)
-					onFailed("ssh keepalive failed")
-					return
+					log.Printf("SSH keepalive request error: %v", err)
+				} else if !ok {
+					log.Printf("SSH keepalive request rejected by server")
 				}
 			}
 		}

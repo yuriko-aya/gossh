@@ -36,10 +36,12 @@ type UploadResponse struct {
 }
 
 func handleSSHConnection(wsConn *websocket.Conn, host, user, password string, privateKey []byte) {
+	ws := newSafeWebSocket(wsConn)
+
 	sshConn, err := dialSSH(host, user, password, privateKey)
 	if err != nil {
 		log.Printf("Failed to connect to SSH server: %v", err)
-		wsConn.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf("Error: Failed to connect: %v\r\n", err)))
+		ws.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf("Error: Failed to connect: %v\r\n", err)))
 		return
 	}
 	defer sshConn.Close()
@@ -48,7 +50,7 @@ func handleSSHConnection(wsConn *websocket.Conn, host, user, password string, pr
 	session, err := sshConn.NewSession()
 	if err != nil {
 		log.Printf("Failed to create SSH session: %v", err)
-		wsConn.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf("Error: Failed to create session: %v\r\n", err)))
+		ws.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf("Error: Failed to create session: %v\r\n", err)))
 		return
 	}
 	defer session.Close()
@@ -63,7 +65,7 @@ func handleSSHConnection(wsConn *websocket.Conn, host, user, password string, pr
 	// Request pseudo terminal
 	if err := session.RequestPty("xterm-256color", 40, 80, modes); err != nil {
 		log.Printf("Failed to request pseudo terminal: %v", err)
-		wsConn.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf("Error: Failed to request PTY: %v\r\n", err)))
+		ws.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf("Error: Failed to request PTY: %v\r\n", err)))
 		return
 	}
 
@@ -89,7 +91,7 @@ func handleSSHConnection(wsConn *websocket.Conn, host, user, password string, pr
 	// Start shell
 	if err := session.Shell(); err != nil {
 		log.Printf("Failed to start shell: %v", err)
-		wsConn.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf("Error: Failed to start shell: %v\r\n", err)))
+		ws.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf("Error: Failed to start shell: %v\r\n", err)))
 		return
 	}
 
@@ -106,8 +108,8 @@ func handleSSHConnection(wsConn *websocket.Conn, host, user, password string, pr
 		})
 	}
 
-	startWebSocketKeepalive(wsConn, keepaliveStop, endSession)
-	startSSHKeepalive(sshConn, keepaliveStop, endSession)
+	startWebSocketKeepalive(ws, keepaliveStop, endSession)
+	startSSHKeepalive(sshConn, keepaliveStop)
 
 	go func() {
 		buf := make([]byte, 1024)
@@ -121,7 +123,7 @@ func handleSSHConnection(wsConn *websocket.Conn, host, user, password string, pr
 				return
 			}
 			if n > 0 {
-				if err := wsConn.WriteMessage(websocket.BinaryMessage, buf[:n]); err != nil {
+				if err := ws.WriteMessage(websocket.BinaryMessage, buf[:n]); err != nil {
 					log.Printf("Error writing stdout to websocket: %v", err)
 					endSession("websocket write failed")
 					return
@@ -141,7 +143,7 @@ func handleSSHConnection(wsConn *websocket.Conn, host, user, password string, pr
 				return
 			}
 			if n > 0 {
-				if err := wsConn.WriteMessage(websocket.BinaryMessage, buf[:n]); err != nil {
+				if err := ws.WriteMessage(websocket.BinaryMessage, buf[:n]); err != nil {
 					log.Printf("Error writing stderr to websocket: %v", err)
 					endSession("websocket write failed")
 					return
@@ -153,7 +155,7 @@ func handleSSHConnection(wsConn *websocket.Conn, host, user, password string, pr
 	// Handle WebSocket input to SSH
 	go func() {
 		for {
-			_, message, err := wsConn.ReadMessage()
+			_, message, err := ws.ReadMessage()
 			if err != nil {
 				log.Printf("Error reading from websocket: %v", err)
 				endSession("websocket closed")
@@ -178,19 +180,19 @@ func handleSSHConnection(wsConn *websocket.Conn, host, user, password string, pr
 					log.Printf("Error resizing terminal: %v", err)
 				}
 			case "upload":
-				go handleFileUpload(wsConn, sshConn, msg)
+				go handleFileUpload(ws, sshConn, msg)
 			case "s3_pull":
-				go handleS3Pull(wsConn, sshConn, msg)
+				go handleS3Pull(ws, sshConn, msg)
 			}
 		}
 	}()
 
 	<-sessionDone
 	session.Wait()
-	wsConn.Close()
+	ws.Close()
 }
 
-func handleFileUpload(wsConn *websocket.Conn, sshConn *ssh.Client, msg WSMessage) {
+func handleFileUpload(ws *safeWebSocket, sshConn *ssh.Client, msg WSMessage) {
 	var response UploadResponse
 	response.Type = "upload_response"
 
@@ -199,7 +201,7 @@ func handleFileUpload(wsConn *websocket.Conn, sshConn *ssh.Client, msg WSMessage
 	if err != nil {
 		response.Success = false
 		response.Error = fmt.Sprintf("Failed to decode file data: %v", err)
-		sendUploadResponse(wsConn, response)
+		sendUploadResponse(ws, response)
 		return
 	}
 
@@ -211,7 +213,7 @@ func handleFileUpload(wsConn *websocket.Conn, sshConn *ssh.Client, msg WSMessage
 	if err != nil {
 		response.Success = false
 		response.Error = fmt.Sprintf("Failed to create upload session: %v", err)
-		sendUploadResponse(wsConn, response)
+		sendUploadResponse(ws, response)
 		return
 	}
 	defer uploadSession.Close()
@@ -221,7 +223,7 @@ func handleFileUpload(wsConn *websocket.Conn, sshConn *ssh.Client, msg WSMessage
 	if err != nil {
 		response.Success = false
 		response.Error = fmt.Sprintf("Failed to get stdin pipe: %v", err)
-		sendUploadResponse(wsConn, response)
+		sendUploadResponse(ws, response)
 		return
 	}
 
@@ -230,7 +232,7 @@ func handleFileUpload(wsConn *websocket.Conn, sshConn *ssh.Client, msg WSMessage
 	if err != nil {
 		response.Success = false
 		response.Error = fmt.Sprintf("Failed to get stderr pipe: %v", err)
-		sendUploadResponse(wsConn, response)
+		sendUploadResponse(ws, response)
 		return
 	}
 
@@ -238,7 +240,7 @@ func handleFileUpload(wsConn *websocket.Conn, sshConn *ssh.Client, msg WSMessage
 	if err := uploadSession.Start(fmt.Sprintf("cat > '%s'", remotePath)); err != nil {
 		response.Success = false
 		response.Error = fmt.Sprintf("Failed to start upload command: %v", err)
-		sendUploadResponse(wsConn, response)
+		sendUploadResponse(ws, response)
 		return
 	}
 
@@ -246,7 +248,7 @@ func handleFileUpload(wsConn *websocket.Conn, sshConn *ssh.Client, msg WSMessage
 	if _, err := stdinPipe.Write(fileData); err != nil {
 		response.Success = false
 		response.Error = fmt.Sprintf("Failed to write file data: %v", err)
-		sendUploadResponse(wsConn, response)
+		sendUploadResponse(ws, response)
 		return
 	}
 	stdinPipe.Close()
@@ -257,30 +259,30 @@ func handleFileUpload(wsConn *websocket.Conn, sshConn *ssh.Client, msg WSMessage
 		stderrData, _ := io.ReadAll(stderrPipe)
 		response.Success = false
 		response.Error = fmt.Sprintf("Failed to upload file: %v - %s", err, string(stderrData))
-		sendUploadResponse(wsConn, response)
+		sendUploadResponse(ws, response)
 		return
 	}
 
 	response.Success = true
 	response.Path = remotePath
-	sendUploadResponse(wsConn, response)
+	sendUploadResponse(ws, response)
 }
 
-func sendUploadResponse(wsConn *websocket.Conn, response UploadResponse) {
+func sendUploadResponse(ws *safeWebSocket, response UploadResponse) {
 	data, err := json.Marshal(response)
 	if err != nil {
 		log.Printf("Failed to marshal upload response: %v", err)
 		return
 	}
 
-	if err := wsConn.WriteMessage(websocket.TextMessage, data); err != nil {
+	if err := ws.WriteMessage(websocket.TextMessage, data); err != nil {
 		log.Printf("Failed to send upload response: %v", err)
 	}
 }
 
 // handleS3Pull generates a presigned GET URL for the uploaded S3 object and
 // uses wget over SSH to pull it onto the remote host.
-func handleS3Pull(wsConn *websocket.Conn, sshConn *ssh.Client, msg WSMessage) {
+func handleS3Pull(ws *safeWebSocket, sshConn *ssh.Client, msg WSMessage) {
 	var response UploadResponse
 	response.Type = "s3_pull_response"
 
@@ -289,7 +291,7 @@ func handleS3Pull(wsConn *websocket.Conn, sshConn *ssh.Client, msg WSMessage) {
 	if !strings.HasPrefix(dest, "/tmp/") {
 		response.Success = false
 		response.Error = "destination must be within /tmp/"
-		sendUploadResponse(wsConn, response)
+		sendUploadResponse(ws, response)
 		return
 	}
 
@@ -298,7 +300,7 @@ func handleS3Pull(wsConn *websocket.Conn, sshConn *ssh.Client, msg WSMessage) {
 	if err != nil {
 		response.Success = false
 		response.Error = fmt.Sprintf("failed to generate download URL: %v", err)
-		sendUploadResponse(wsConn, response)
+		sendUploadResponse(ws, response)
 		return
 	}
 
@@ -306,7 +308,7 @@ func handleS3Pull(wsConn *websocket.Conn, sshConn *ssh.Client, msg WSMessage) {
 	if err != nil {
 		response.Success = false
 		response.Error = fmt.Sprintf("failed to create pull session: %v", err)
-		sendUploadResponse(wsConn, response)
+		sendUploadResponse(ws, response)
 		return
 	}
 	defer pullSession.Close()
@@ -315,7 +317,7 @@ func handleS3Pull(wsConn *websocket.Conn, sshConn *ssh.Client, msg WSMessage) {
 	if err != nil {
 		response.Success = false
 		response.Error = fmt.Sprintf("failed to get stderr pipe: %v", err)
-		sendUploadResponse(wsConn, response)
+		sendUploadResponse(ws, response)
 		return
 	}
 
@@ -326,13 +328,13 @@ func handleS3Pull(wsConn *websocket.Conn, sshConn *ssh.Client, msg WSMessage) {
 		stderrData, _ := io.ReadAll(stderrPipe)
 		response.Success = false
 		response.Error = fmt.Sprintf("wget failed: %v - %s", err, string(stderrData))
-		sendUploadResponse(wsConn, response)
+		sendUploadResponse(ws, response)
 		return
 	}
 
 	response.Success = true
 	response.Path = dest
-	sendUploadResponse(wsConn, response)
+	sendUploadResponse(ws, response)
 }
 
 func uploadFileViaSSH(file multipart.File, filename, host, user, password string, privateKey []byte) (string, error) {
