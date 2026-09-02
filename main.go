@@ -6,35 +6,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"html/template"
-	"io"
 	"log"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
-	"github.com/fernet/fernet-go"
 	"github.com/gorilla/websocket"
-	"gopkg.in/yaml.v3"
 )
-
-type Config struct {
-	Server struct {
-		Address string `yaml:"address"`
-		Port    int    `yaml:"port"`
-	} `yaml:"server"`
-	Security struct {
-		FernetKey string `yaml:"fernet_key"`
-	} `yaml:"security"`
-	S3 struct {
-		Region          string `yaml:"region"`
-		Bucket          string `yaml:"bucket"`
-		AccessKeyID     string `yaml:"access_key_id"`
-		SecretAccessKey string `yaml:"secret_access_key"`
-	} `yaml:"s3"`
-}
 
 var (
 	upgrader = websocket.Upgrader{
@@ -65,20 +45,6 @@ type SSHCredentials struct {
 }
 
 func init() {
-	// Load configuration
-	if err := loadConfig("config.yaml"); err != nil {
-		log.Fatalf("Failed to load config: %v", err)
-	}
-
-	// Validate Fernet key
-	if config.Security.FernetKey == "" {
-		log.Fatal("Fernet key is not configured. Please set security.fernet_key in config.yaml")
-	}
-	if _, err := fernet.DecodeKeys(config.Security.FernetKey); err != nil {
-		log.Fatalf("Invalid Fernet key in config: %v", err)
-	}
-
-	// Load templates
 	var err error
 	tmpl, err = template.ParseGlob("templates/*.html")
 	if err != nil {
@@ -86,34 +52,27 @@ func init() {
 	}
 }
 
-func loadConfig(filename string) error {
-	file, err := os.Open(filename)
-	if err != nil {
-		return fmt.Errorf("error opening config file: %v", err)
-	}
-	defer file.Close()
-
-	data, err := io.ReadAll(file)
-	if err != nil {
-		return fmt.Errorf("error reading config file: %v", err)
-	}
-
-	if err := yaml.Unmarshal(data, &config); err != nil {
-		return fmt.Errorf("error parsing config file: %v", err)
-	}
-
-	return nil
-}
-
 func main() {
+	configPath := os.Getenv("GOSSH_CONFIG")
+	if configPath == "" {
+		configPath = "config.yaml"
+	}
+	if err := loadConfig(configPath); err != nil {
+		log.Fatalf("Failed to load config: %v", err)
+	}
+
+	connectLimiter := newRateLimiter(config.RateLimit.ConnectPerMinute, time.Minute)
+	wsLimiter := newRateLimiter(config.RateLimit.WSPerMinute, time.Minute)
+	presignLimiter := newRateLimiter(config.RateLimit.PresignPerMinute, time.Minute)
+
 	http.HandleFunc("/", indexHandler)
 	http.HandleFunc("/terminal", terminalHandler)
 	http.HandleFunc("/upload", uploadHandler)
-	http.HandleFunc("/presign", presignHandler)
+	http.HandleFunc("/presign", withRateLimit(presignLimiter, presignHandler))
 	http.HandleFunc("/download", downloadHandler)
 	http.HandleFunc("/validate-download", validateDownloadHandler)
-	http.HandleFunc("/connect", connectHandler)
-	http.HandleFunc("/ws", wsHandler)
+	http.HandleFunc("/connect", withRateLimit(connectLimiter, connectHandler))
+	http.HandleFunc("/ws", withRateLimit(wsLimiter, wsHandler))
 	http.HandleFunc("/static/", noCacheStaticHandler)
 
 	addr := fmt.Sprintf("%s:%d", config.Server.Address, config.Server.Port)
@@ -133,7 +92,6 @@ func noCacheStaticHandler(w http.ResponseWriter, r *http.Request) {
 func indexHandler(w http.ResponseWriter, r *http.Request) {
 	var creds SSHCredentials
 
-	// Check for direct access via 'access' parameter
 	accessParam := r.URL.Query().Get("access")
 	if accessParam != "" {
 		var err error
@@ -144,10 +102,8 @@ func indexHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Store the access token for use in WebSocket/download/upload
 		creds.AccessToken = accessParam
 
-		// Direct access mode - render terminal page directly
 		if tmpl != nil {
 			tmpl.ExecuteTemplate(w, "terminal.html", creds)
 		} else {
@@ -156,7 +112,6 @@ func indexHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Normal mode - render the form page
 	if tmpl != nil {
 		tmpl.ExecuteTemplate(w, "index.html", creds)
 	} else {
@@ -190,10 +145,8 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Parse multipart form (max 2GB)
-	r.ParseMultipartForm(2 << 30) // 2GB
+	r.ParseMultipartForm(2 << 30)
 
-	// Get file from form
 	file, header, err := r.FormFile("file")
 	if err != nil {
 		respondJSON(w, map[string]interface{}{
@@ -204,13 +157,11 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
-	// Check if using access token
 	accessParam := r.FormValue("access")
 	var host, user, password string
 	var privateKey []byte
 
 	if accessParam != "" {
-		// Decrypt access token to get credentials
 		creds, err := decryptAccess(accessParam)
 		if err != nil {
 			respondJSON(w, map[string]interface{}{
@@ -233,7 +184,6 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Upload file via SSH
 	remotePath, err := uploadFileViaSSH(file, header.Filename, host, user, password, privateKey)
 	if err != nil {
 		respondJSON(w, map[string]interface{}{
@@ -255,7 +205,6 @@ func respondJSON(w http.ResponseWriter, data map[string]interface{}) {
 }
 
 func presignHandler(w http.ResponseWriter, r *http.Request) {
-	// Require a valid access token — confirms the caller has an active SSH session
 	accessParam := r.URL.Query().Get("access")
 	if accessParam == "" {
 		http.Error(w, "access token required", http.StatusBadRequest)
@@ -272,7 +221,6 @@ func presignHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Generate a random prefix so keys never collide and can't be guessed
 	randBytes := make([]byte, 8)
 	if _, err := rand.Read(randBytes); err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
@@ -293,7 +241,6 @@ func presignHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func validateDownloadHandler(w http.ResponseWriter, r *http.Request) {
-	// Check if using access token
 	accessParam := r.URL.Query().Get("access")
 	remotePath := r.URL.Query().Get("path")
 
@@ -302,7 +249,6 @@ func validateDownloadHandler(w http.ResponseWriter, r *http.Request) {
 	var err error
 
 	if accessParam != "" {
-		// Decrypt access token to get credentials
 		creds, err := decryptAccess(accessParam)
 		if err != nil {
 			respondJSON(w, map[string]interface{}{
@@ -333,24 +279,14 @@ func validateDownloadHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validate remote path - only allow downloads from /home, /opt, and /tmp
-	allowedPaths := []string{"/home/", "/opt/", "/tmp/", "/var/log/"}
-	isAllowed := false
-	for _, prefix := range allowedPaths {
-		if strings.HasPrefix(remotePath, prefix) {
-			isAllowed = true
-			break
-		}
-	}
-	if !isAllowed {
+	if !isAllowedDownloadPath(remotePath) {
 		respondJSON(w, map[string]interface{}{
 			"valid": false,
-			"error": "Access denied: Downloads are only allowed from /home, /opt, /var/log, and /tmp directories",
+			"error": allowedDownloadPathError(),
 		})
 		return
 	}
 
-	// Check if file exists via SSH
 	fileInfo, err := validateFileViaSSH(remotePath, host, user, password, privateKey)
 	if err != nil {
 		respondJSON(w, map[string]interface{}{
@@ -368,7 +304,6 @@ func validateDownloadHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func downloadHandler(w http.ResponseWriter, r *http.Request) {
-	// Check if using access token
 	accessParam := r.URL.Query().Get("access")
 	remotePath := r.URL.Query().Get("path")
 
@@ -377,7 +312,6 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 	var err error
 
 	if accessParam != "" {
-		// Decrypt access token to get credentials
 		creds, err := decryptAccess(accessParam)
 		if err != nil {
 			http.Error(w, "Invalid access token", http.StatusBadRequest)
@@ -400,85 +334,12 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Stream file from SSH server directly to response
 	_, err = downloadFileViaSSH(w, remotePath, host, user, password, privateKey)
 	if err != nil {
 		log.Printf("Download failed: %v", err)
 		http.Error(w, "Download failed: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-}
-
-func decryptAccess(encrypted string) (SSHCredentials, error) {
-	var creds SSHCredentials
-
-	// Get and validate Fernet key
-	fernetKey := getDefaultFernetKey()
-	if fernetKey == "" {
-		return creds, fmt.Errorf("fernet key not configured")
-	}
-
-	// Decode the Fernet token
-	key, err := fernet.DecodeKeys(fernetKey)
-	if err != nil {
-		return creds, fmt.Errorf("invalid fernet key: %v", err)
-	}
-
-	token_64 := fernet.VerifyAndDecrypt([]byte(encrypted), 0, key)
-	if token_64 == nil {
-		return creds, fmt.Errorf("failed to decrypt access token")
-	}
-
-	token, err := base64.StdEncoding.DecodeString(string(token_64))
-	if err != nil {
-		return creds, err
-	}
-
-	// Parse the decrypted data
-	values, err := url.ParseQuery(string(token))
-	if err != nil {
-		return creds, err
-	}
-
-	creds.User = values.Get("username")
-	creds.Host = values.Get("hostname")
-	creds.Password = values.Get("password")
-	creds.PrivateKey = values.Get("privatekey")
-
-	return creds, nil
-}
-
-// getDefaultFernetKey returns the Fernet key from configuration
-func getDefaultFernetKey() string {
-	return config.Security.FernetKey
-}
-
-func encryptAccess(creds SSHCredentials) (string, error) {
-	fernetKey := getDefaultFernetKey()
-	if fernetKey == "" {
-		return "", fmt.Errorf("fernet key not configured")
-	}
-	keys, err := fernet.DecodeKeys(fernetKey)
-	if err != nil {
-		return "", fmt.Errorf("invalid fernet key: %v", err)
-	}
-
-	values := url.Values{}
-	values.Set("username", creds.User)
-	values.Set("hostname", creds.Host)
-	if creds.Password != "" {
-		values.Set("password", creds.Password)
-	}
-	if creds.PrivateKey != "" {
-		values.Set("privatekey", creds.PrivateKey)
-	}
-
-	dataB64 := base64.StdEncoding.EncodeToString([]byte(values.Encode()))
-	tok, err := fernet.EncryptAndSign([]byte(dataB64), keys[0])
-	if err != nil {
-		return "", fmt.Errorf("encryption failed: %v", err)
-	}
-	return string(tok), nil
 }
 
 func connectHandler(w http.ResponseWriter, r *http.Request) {

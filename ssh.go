@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -35,35 +36,7 @@ type UploadResponse struct {
 }
 
 func handleSSHConnection(wsConn *websocket.Conn, host, user, password string, privateKey []byte) {
-	// Build SSH client configuration
-	config := &ssh.ClientConfig{
-		User:            user,
-		Auth:            []ssh.AuthMethod{},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(), // WARNING: Use proper host key verification in production
-	}
-
-	// Add authentication methods
-	if password != "" {
-		config.Auth = append(config.Auth, ssh.Password(password))
-	}
-
-	if len(privateKey) > 0 {
-		signer, err := ssh.ParsePrivateKey(privateKey)
-		if err != nil {
-			log.Printf("Failed to parse private key: %v", err)
-			wsConn.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf("Error: Failed to parse private key: %v\r\n", err)))
-			return
-		}
-		config.Auth = append(config.Auth, ssh.PublicKeys(signer))
-	}
-
-	// Add default port if not specified
-	if !containsPort(host) {
-		host = host + ":22"
-	}
-
-	// Connect to SSH server
-	sshConn, err := ssh.Dial("tcp", host, config)
+	sshConn, err := dialSSH(host, user, password, privateKey)
 	if err != nil {
 		log.Printf("Failed to connect to SSH server: %v", err)
 		wsConn.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf("Error: Failed to connect: %v\r\n", err)))
@@ -120,8 +93,21 @@ func handleSSHConnection(wsConn *websocket.Conn, host, user, password string, pr
 		return
 	}
 
-	// Handle SSH output to WebSocket
-	done := make(chan bool)
+	sessionDone := make(chan struct{})
+	keepaliveStop := make(chan struct{})
+	var endOnce sync.Once
+	endSession := func(reason string) {
+		endOnce.Do(func() {
+			log.Printf("Ending SSH session: %s", reason)
+			stdin.Close()
+			session.Close()
+			close(keepaliveStop)
+			close(sessionDone)
+		})
+	}
+
+	startWebSocketKeepalive(wsConn, keepaliveStop, endSession)
+	startSSHKeepalive(sshConn, keepaliveStop, endSession)
 
 	go func() {
 		buf := make([]byte, 1024)
@@ -131,11 +117,15 @@ func handleSSHConnection(wsConn *websocket.Conn, host, user, password string, pr
 				if err != io.EOF {
 					log.Printf("Error reading stdout: %v", err)
 				}
-				done <- true
+				endSession("stdout closed")
 				return
 			}
 			if n > 0 {
-				wsConn.WriteMessage(websocket.BinaryMessage, buf[:n])
+				if err := wsConn.WriteMessage(websocket.BinaryMessage, buf[:n]); err != nil {
+					log.Printf("Error writing stdout to websocket: %v", err)
+					endSession("websocket write failed")
+					return
+				}
 			}
 		}
 	}()
@@ -151,7 +141,11 @@ func handleSSHConnection(wsConn *websocket.Conn, host, user, password string, pr
 				return
 			}
 			if n > 0 {
-				wsConn.WriteMessage(websocket.BinaryMessage, buf[:n])
+				if err := wsConn.WriteMessage(websocket.BinaryMessage, buf[:n]); err != nil {
+					log.Printf("Error writing stderr to websocket: %v", err)
+					endSession("websocket write failed")
+					return
+				}
 			}
 		}
 	}()
@@ -162,7 +156,7 @@ func handleSSHConnection(wsConn *websocket.Conn, host, user, password string, pr
 			_, message, err := wsConn.ReadMessage()
 			if err != nil {
 				log.Printf("Error reading from websocket: %v", err)
-				stdin.Close()
+				endSession("websocket closed")
 				return
 			}
 
@@ -173,51 +167,27 @@ func handleSSHConnection(wsConn *websocket.Conn, host, user, password string, pr
 			}
 
 			switch msg.Type {
-			case "ping":
-				// Heartbeat from client — silently ignored
 			case "input":
-				// Write user input to SSH stdin
 				if _, err := stdin.Write([]byte(msg.Data)); err != nil {
 					log.Printf("Error writing to stdin: %v", err)
+					endSession("stdin write failed")
 					return
 				}
 			case "resize":
-				// Resize terminal
 				if err := session.WindowChange(msg.Rows, msg.Cols); err != nil {
 					log.Printf("Error resizing terminal: %v", err)
 				}
 			case "upload":
-				// Handle file upload
 				go handleFileUpload(wsConn, sshConn, msg)
 			case "s3_pull":
-				// Pull a file from S3 presigned URL onto the remote host
 				go handleS3Pull(wsConn, sshConn, msg)
 			}
 		}
 	}()
 
-	// Wait for session to finish or stdout to close
-	<-done
-	log.Println("SSH session ended")
-
-	// Wait for session to finish
+	<-sessionDone
 	session.Wait()
-
-	// Close the WebSocket connection
 	wsConn.Close()
-}
-
-func containsPort(host string) bool {
-	for i := len(host) - 1; i >= 0; i-- {
-		if host[i] == ':' {
-			return true
-		}
-		if host[i] == ']' {
-			// IPv6 address without port
-			return false
-		}
-	}
-	return false
 }
 
 func handleFileUpload(wsConn *websocket.Conn, sshConn *ssh.Client, msg WSMessage) {
@@ -366,35 +336,9 @@ func handleS3Pull(wsConn *websocket.Conn, sshConn *ssh.Client, msg WSMessage) {
 }
 
 func uploadFileViaSSH(file multipart.File, filename, host, user, password string, privateKey []byte) (string, error) {
-	// Build SSH client configuration
-	config := &ssh.ClientConfig{
-		User:            user,
-		Auth:            []ssh.AuthMethod{},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-	}
-
-	// Add authentication methods
-	if password != "" {
-		config.Auth = append(config.Auth, ssh.Password(password))
-	}
-
-	if len(privateKey) > 0 {
-		signer, err := ssh.ParsePrivateKey(privateKey)
-		if err != nil {
-			return "", fmt.Errorf("failed to parse private key: %v", err)
-		}
-		config.Auth = append(config.Auth, ssh.PublicKeys(signer))
-	}
-
-	// Add default port if not specified
-	if !containsPort(host) {
-		host = host + ":22"
-	}
-
-	// Connect to SSH server
-	sshConn, err := ssh.Dial("tcp", host, config)
+	sshConn, err := dialSSH(host, user, password, privateKey)
 	if err != nil {
-		return "", fmt.Errorf("failed to connect to SSH server: %v", err)
+		return "", err
 	}
 	defer sshConn.Close()
 
@@ -441,48 +385,13 @@ func uploadFileViaSSH(file multipart.File, filename, host, user, password string
 }
 
 func validateFileViaSSH(remotePath, host, user, password string, privateKey []byte) (map[string]interface{}, error) {
-	// Validate remote path - only allow downloads from /home, /opt, /tmp, and /var/log
-	allowedPaths := []string{"/home/", "/opt/", "/tmp/", "/var/log/"}
-	isAllowed := false
-	for _, prefix := range allowedPaths {
-		if len(remotePath) >= len(prefix) && remotePath[:len(prefix)] == prefix {
-			isAllowed = true
-			break
-		}
-	}
-	if !isAllowed {
+	if !isAllowedDownloadPath(remotePath) {
 		return nil, fmt.Errorf("access denied: downloads are only allowed from /home, /opt, /var/log, and /tmp directories")
 	}
 
-	// Build SSH client configuration
-	config := &ssh.ClientConfig{
-		User:            user,
-		Auth:            []ssh.AuthMethod{},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-	}
-
-	// Add authentication methods
-	if password != "" {
-		config.Auth = append(config.Auth, ssh.Password(password))
-	}
-
-	if len(privateKey) > 0 {
-		signer, err := ssh.ParsePrivateKey(privateKey)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse private key: %v", err)
-		}
-		config.Auth = append(config.Auth, ssh.PublicKeys(signer))
-	}
-
-	// Add default port if not specified
-	if !containsPort(host) {
-		host = host + ":22"
-	}
-
-	// Connect to SSH server
-	sshConn, err := ssh.Dial("tcp", host, config)
+	sshConn, err := dialSSH(host, user, password, privateKey)
 	if err != nil {
-		return nil, fmt.Errorf("failed to connect to SSH server: %v", err)
+		return nil, err
 	}
 	defer sshConn.Close()
 
@@ -515,48 +424,13 @@ func validateFileViaSSH(remotePath, host, user, password string, privateKey []by
 }
 
 func downloadFileViaSSH(w http.ResponseWriter, remotePath, host, user, password string, privateKey []byte) (string, error) {
-	// Validate remote path - only allow downloads from /home, /opt, /tmp, and /var/log
-	allowedPaths := []string{"/home/", "/opt/", "/tmp/", "/var/log/"}
-	isAllowed := false
-	for _, prefix := range allowedPaths {
-		if len(remotePath) >= len(prefix) && remotePath[:len(prefix)] == prefix {
-			isAllowed = true
-			break
-		}
-	}
-	if !isAllowed {
+	if !isAllowedDownloadPath(remotePath) {
 		return "", fmt.Errorf("access denied: downloads are only allowed from /home, /opt, /var/log, and /tmp directories")
 	}
 
-	// Build SSH client configuration
-	config := &ssh.ClientConfig{
-		User:            user,
-		Auth:            []ssh.AuthMethod{},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-	}
-
-	// Add authentication methods
-	if password != "" {
-		config.Auth = append(config.Auth, ssh.Password(password))
-	}
-
-	if len(privateKey) > 0 {
-		signer, err := ssh.ParsePrivateKey(privateKey)
-		if err != nil {
-			return "", fmt.Errorf("failed to parse private key: %v", err)
-		}
-		config.Auth = append(config.Auth, ssh.PublicKeys(signer))
-	}
-
-	// Add default port if not specified
-	if !containsPort(host) {
-		host = host + ":22"
-	}
-
-	// Connect to SSH server
-	sshConn, err := ssh.Dial("tcp", host, config)
+	sshConn, err := dialSSH(host, user, password, privateKey)
 	if err != nil {
-		return "", fmt.Errorf("failed to connect to SSH server: %v", err)
+		return "", err
 	}
 	defer sshConn.Close()
 
