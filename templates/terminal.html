@@ -476,6 +476,12 @@
                 const file = e.target.files[0];
                 if (!file) return;
 
+                if (!Number.isFinite(file.size) || file.size <= 0) {
+                    term.write('\r\n\x1b[1;31mError: Cannot upload — invalid or empty file\x1b[0m\r\n');
+                    fileInput.value = '';
+                    return;
+                }
+
                 if (file.size > MAX_UPLOAD_BYTES) {
                     const sizeGB = (file.size / 1024 / 1024 / 1024).toFixed(2);
                     term.write(`\r\n\x1b[1;31mError: File is ${sizeGB} GB — maximum upload size is 5 GB\x1b[0m\r\n`);
@@ -509,7 +515,15 @@
                 
                 try {
                     const presignResp = await fetch(
-                        `/presign?access=${encodeURIComponent(sshCredentials.access)}&filename=${encodeURIComponent(file.name)}&size=${file.size}`
+                        `/presign?access=${encodeURIComponent(sshCredentials.access)}`,
+                        {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                            body: new URLSearchParams({
+                                filename: file.name,
+                                size: String(file.size)
+                            })
+                        }
                     );
                     const presignData = await presignResp.json();
                     if (!presignResp.ok || presignData.error) {

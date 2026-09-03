@@ -206,6 +206,11 @@ func respondJSON(w http.ResponseWriter, data map[string]interface{}) {
 }
 
 func presignHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
 	accessParam := r.URL.Query().Get("access")
 	if accessParam == "" {
 		http.Error(w, "access token required", http.StatusBadRequest)
@@ -216,13 +221,31 @@ func presignHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	filename := filepath.Base(r.URL.Query().Get("filename"))
+	if r.Method == http.MethodPost {
+		if err := r.ParseForm(); err != nil {
+			respondJSON(w, map[string]interface{}{"success": false, "error": "invalid form data"})
+			return
+		}
+	}
+
+	filename := filepath.Base(r.FormValue("filename"))
+	if filename == "" || filename == "." {
+		filename = filepath.Base(r.URL.Query().Get("filename"))
+	}
 	if filename == "" || filename == "." {
 		http.Error(w, "filename required", http.StatusBadRequest)
 		return
 	}
 
-	size, err := strconv.ParseInt(r.URL.Query().Get("size"), 10, 64)
+	sizeStr := r.FormValue("size")
+	if sizeStr == "" {
+		sizeStr = r.URL.Query().Get("size")
+	}
+	if sizeStr == "" {
+		respondJSON(w, map[string]interface{}{"success": false, "error": "missing file size"})
+		return
+	}
+	size, err := strconv.ParseInt(sizeStr, 10, 64)
 	if err != nil {
 		respondJSON(w, map[string]interface{}{"success": false, "error": "invalid file size"})
 		return
