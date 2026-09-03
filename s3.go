@@ -11,6 +11,19 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
 
+// MaxS3PutObjectSize is the AWS S3 limit for a single PUT upload.
+const MaxS3PutObjectSize int64 = 5 * 1024 * 1024 * 1024
+
+func validateUploadSize(size int64) error {
+	if size <= 0 {
+		return fmt.Errorf("file size required")
+	}
+	if size > MaxS3PutObjectSize {
+		return fmt.Errorf("file exceeds maximum upload size of 5 GB (S3 single PUT limit)")
+	}
+	return nil
+}
+
 func newS3PresignClient() (*s3.PresignClient, error) {
 	cfg, err := awsconfig.LoadDefaultConfig(context.TODO(),
 		awsconfig.WithRegion(config.S3.Region),

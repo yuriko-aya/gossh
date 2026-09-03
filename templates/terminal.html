@@ -122,6 +122,32 @@
             color: #aaa;
         }
 
+        .upload-progress-actions {
+            margin-top: 12px;
+            text-align: right;
+        }
+
+        .upload-cancel-btn {
+            background: #555;
+            color: white;
+            border: none;
+            padding: 5px 14px;
+            border-radius: 4px;
+            font-size: 12px;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+
+        .upload-cancel-btn:hover {
+            background: #666;
+        }
+
+        .upload-cancel-btn:disabled {
+            background: #444;
+            color: #888;
+            cursor: not-allowed;
+        }
+
         #terminal {
             flex: 1;
             overflow: hidden;
@@ -283,6 +309,9 @@
             <div class="progress-fill" id="progressFill"></div>
         </div>
         <div class="progress-text" id="progressText">0% - 0 MB / 0 MB</div>
+        <div class="upload-progress-actions">
+            <button class="upload-cancel-btn" id="uploadCancelBtn" type="button">Cancel</button>
+        </div>
     </div>
 
     <div class="disconnect-overlay" id="disconnectOverlay">
@@ -307,6 +336,9 @@
         let terminalInitialized = false;
         let connectionHost = '';
         let connectionUser = '';
+        let activeUploadXHR = null;
+        let uploadCancelled = false;
+        const MAX_UPLOAD_BYTES = 5 * 1024 * 1024 * 1024; // S3 single PUT limit
 
         window.addEventListener('beforeunload', function() {
             intentionalClose = true;
@@ -333,6 +365,29 @@
             hideDisconnectDialog();
             window.close();
         });
+
+        document.getElementById('uploadCancelBtn').addEventListener('click', function() {
+            if (activeUploadXHR) {
+                uploadCancelled = true;
+                activeUploadXHR.abort();
+            }
+        });
+
+        function resetUploadUI() {
+            const progressDiv = document.getElementById('uploadProgress');
+            const uploadBtn = document.getElementById('uploadBtn');
+            const fileInput = document.getElementById('fileInput');
+            const cancelBtn = document.getElementById('uploadCancelBtn');
+
+            progressDiv.classList.remove('active');
+            uploadBtn.disabled = false;
+            uploadBtn.textContent = 'Upload File';
+            cancelBtn.disabled = false;
+            cancelBtn.style.display = '';
+            fileInput.value = '';
+            activeUploadXHR = null;
+            uploadCancelled = false;
+        }
 
         function updateStatus(message, type) {
             const statusEl = document.getElementById('status');
@@ -413,17 +468,25 @@
         function handleFileUpload(host, user) {
             const fileInput = document.getElementById('fileInput');
             const uploadBtn = document.getElementById('uploadBtn');
+            const cancelBtn = document.getElementById('uploadCancelBtn');
             
             fileInput.click();
             
             fileInput.onchange = async function(e) {
                 const file = e.target.files[0];
                 if (!file) return;
+
+                if (file.size > MAX_UPLOAD_BYTES) {
+                    const sizeGB = (file.size / 1024 / 1024 / 1024).toFixed(2);
+                    term.write(`\r\n\x1b[1;31mError: File is ${sizeGB} GB — maximum upload size is 5 GB\x1b[0m\r\n`);
+                    fileInput.value = '';
+                    return;
+                }
                 
                 uploadBtn.disabled = true;
                 uploadBtn.textContent = 'Uploading...';
+                uploadCancelled = false;
                 
-                // Show progress UI
                 const progressDiv = document.getElementById('uploadProgress');
                 const progressFill = document.getElementById('progressFill');
                 const progressText = document.getElementById('progressText');
@@ -433,72 +496,78 @@
                 progressDiv.classList.add('active');
                 progressFill.style.width = '0%';
                 progressText.textContent = '0% - 0 MB / ' + (file.size / 1024 / 1024).toFixed(2) + ' MB';
+                cancelBtn.disabled = false;
+                cancelBtn.style.display = '';
                 
                 term.write(`\r\n\x1b[1;36mUploading ${file.name} (${(file.size / 1024 / 1024).toFixed(2)} MB)...\x1b[0m\r\n`);
                 
                 if (!sshCredentials.access) {
                     term.write('\r\n\x1b[1;31mError: Cannot upload — missing access token. Please reconnect.\x1b[0m\r\n');
-                    progressDiv.classList.remove('active');
-                    uploadBtn.disabled = false;
-                    uploadBtn.textContent = 'Upload File';
-                    fileInput.value = '';
+                    resetUploadUI();
                     return;
                 }
                 
                 try {
-                    // Step 1: obtain a presigned S3 PUT URL from the server
                     const presignResp = await fetch(
-                        `/presign?access=${encodeURIComponent(sshCredentials.access)}&filename=${encodeURIComponent(file.name)}`
+                        `/presign?access=${encodeURIComponent(sshCredentials.access)}&filename=${encodeURIComponent(file.name)}&size=${file.size}`
                     );
-                    if (!presignResp.ok) {
-                        throw new Error('Failed to get upload URL (HTTP ' + presignResp.status + ')');
-                    }
                     const presignData = await presignResp.json();
-                    if (presignData.error) throw new Error(presignData.error);
+                    if (!presignResp.ok || presignData.error) {
+                        throw new Error(presignData.error || ('Failed to get upload URL (HTTP ' + presignResp.status + ')'));
+                    }
                     
-                    // Step 2: PUT the file directly to S3 (no gossh server bandwidth)
                     await new Promise((resolve, reject) => {
                         const xhr = new XMLHttpRequest();
+                        activeUploadXHR = xhr;
                         
-                        xhr.upload.addEventListener('progress', function(e) {
-                            if (e.lengthComputable) {
-                                const pct = (e.loaded / e.total) * 100;
-                                const mbLoaded = (e.loaded / 1024 / 1024).toFixed(2);
-                                const mbTotal  = (e.total  / 1024 / 1024).toFixed(2);
+                        xhr.upload.addEventListener('progress', function(ev) {
+                            if (ev.lengthComputable) {
+                                const pct = (ev.loaded / ev.total) * 100;
+                                const mbLoaded = (ev.loaded / 1024 / 1024).toFixed(2);
+                                const mbTotal  = (ev.total  / 1024 / 1024).toFixed(2);
                                 progressFill.style.width = pct + '%';
                                 progressText.textContent = pct.toFixed(0) + '% - ' + mbLoaded + ' MB / ' + mbTotal + ' MB';
                             }
                         });
                         
                         xhr.addEventListener('load', function() {
+                            activeUploadXHR = null;
                             if (xhr.status >= 200 && xhr.status < 300) resolve();
                             else reject(new Error('S3 upload failed with status ' + xhr.status));
                         });
-                        xhr.addEventListener('error', () => reject(new Error('Network error during S3 upload')));
+                        xhr.addEventListener('abort', function() {
+                            activeUploadXHR = null;
+                            reject(new Error('Upload cancelled'));
+                        });
+                        xhr.addEventListener('error', function() {
+                            activeUploadXHR = null;
+                            reject(new Error('Network error during S3 upload'));
+                        });
                         
                         xhr.open('PUT', presignData.upload_url, true);
                         xhr.setRequestHeader('Content-Type', 'application/octet-stream');
                         xhr.send(file);
                     });
                     
+                    cancelBtn.disabled = true;
+                    cancelBtn.style.display = 'none';
                     progressFill.style.width = '100%';
                     progressText.textContent = '100% - Pulling to remote server...';
                     term.write(`\r\n\x1b[1;36mPulling file to remote server...\x1b[0m\r\n`);
                     
-                    // Step 3: tell gossh to wget the object from S3 onto the remote host
                     socket.send(JSON.stringify({
                         type: 's3_pull',
                         key:  presignData.object_key,
                         dest: '/tmp/' + file.name
                     }));
-                    // Result arrives via s3_pull_response in socket.onmessage
                     
                 } catch (error) {
-                    term.write(`\r\n\x1b[1;31mUpload failed: ${error.message}\x1b[0m\r\n`);
-                    progressDiv.classList.remove('active');
-                    uploadBtn.disabled = false;
-                    uploadBtn.textContent = 'Upload File';
-                    fileInput.value = '';
+                    if (uploadCancelled || error.message === 'Upload cancelled') {
+                        term.write('\r\n\x1b[1;33mUpload cancelled\x1b[0m\r\n');
+                    } else {
+                        term.write(`\r\n\x1b[1;31mUpload failed: ${error.message}\x1b[0m\r\n`);
+                    }
+                    resetUploadUI();
                 }
             };
         }
@@ -507,7 +576,6 @@
             const progressDiv  = document.getElementById('uploadProgress');
             const progressText = document.getElementById('progressText');
             const uploadBtn    = document.getElementById('uploadBtn');
-            const fileInput    = document.getElementById('fileInput');
             
             if (msg.success) {
                 progressText.textContent = '100% - Upload complete!';
@@ -521,12 +589,7 @@
                 term.write(`\r\n\x1b[1;31mUpload failed: ${msg.error}\x1b[0m\r\n`);
             }
             
-            setTimeout(() => {
-                progressDiv.classList.remove('active');
-                uploadBtn.disabled = false;
-                uploadBtn.textContent = 'Upload File';
-                fileInput.value = '';
-            }, 2000);
+            setTimeout(resetUploadUI, 2000);
         }
 
         function fitTerminal() {
