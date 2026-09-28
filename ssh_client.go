@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"strings"
 	"time"
 
 	"golang.org/x/crypto/ssh"
@@ -53,7 +54,40 @@ func buildSSHConfig(user, password string, privateKey []byte) (*ssh.ClientConfig
 	return cfg, nil
 }
 
+// sanitizeUsername replaces every rune that is not [A-Za-z0-9_] with '_'.
+func sanitizeUsername(user string) string {
+	var b strings.Builder
+	for _, r := range user {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '_':
+			b.WriteRune(r)
+		default:
+			b.WriteRune('_')
+		}
+	}
+	return b.String()
+}
+
 func dialSSH(host, user, password string, privateKey []byte) (*ssh.Client, error) {
+	client, err := dialSSHOnce(host, user, password, privateKey)
+	if err == nil {
+		return client, nil
+	}
+
+	altUser := sanitizeUsername(user)
+	if altUser == user || altUser == "" {
+		return nil, err
+	}
+
+	log.Printf("SSH connect as %q failed, retrying as %q: %v", user, altUser, err)
+	client, altErr := dialSSHOnce(host, altUser, password, privateKey)
+	if altErr != nil {
+		return nil, err
+	}
+	return client, nil
+}
+
+func dialSSHOnce(host, user, password string, privateKey []byte) (*ssh.Client, error) {
 	cfg, err := buildSSHConfig(user, password, privateKey)
 	if err != nil {
 		return nil, err

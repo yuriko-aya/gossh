@@ -50,3 +50,21 @@ func TestBuildSSHConfig(t *testing.T) {
 		t.Fatalf("expected 1 auth method, got %d", len(cfg.Auth))
 	}
 }
+
+func TestSanitizeUsername(t *testing.T) {
+	tests := []struct {
+		in   string
+		want string
+	}{
+		{"alice", "alice"},
+		{"user.name", "user_name"},
+		{"user@example.com", "user_example_com"},
+		{"already_valid_123", "already_valid_123"},
+		{"a-b/c", "a_b_c"},
+	}
+	for _, tc := range tests {
+		if got := sanitizeUsername(tc.in); got != tc.want {
+			t.Errorf("sanitizeUsername(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
