@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
 	"path/filepath"
 	"strconv"
@@ -9,34 +10,86 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-const uploadDestScript = `tmp_src=$(findmnt -no SOURCE -- /tmp 2>/dev/null || df --output=source /tmp | tail -1)
-root_src=$(findmnt -no SOURCE -- / 2>/dev/null || df --output=source / | tail -1)
-if [ "$tmp_src" = "$root_src" ]; then base=/tmp; else base=/var/tmp; fi
-avail=$(df -B1 --output=avail "$base" | tail -1)
-printf '%s %s\n' "$base" "$avail"`
+const remoteMountInfoPath = "/proc/self/mountinfo"
 
-func parseUploadDestOutput(output string) (base string, avail int64, err error) {
-	line := strings.TrimSpace(output)
-	if line == "" {
-		return "", 0, fmt.Errorf("empty upload destination check output")
+type mountInfoEntry struct {
+	mountPoint string
+}
+
+func unescapeMountPoint(s string) string {
+	s = strings.ReplaceAll(s, "\\134", `\`)
+	s = strings.ReplaceAll(s, "\\040", " ")
+	s = strings.ReplaceAll(s, "\\011", "\t")
+	s = strings.ReplaceAll(s, "\\012", "\n")
+	s = strings.ReplaceAll(s, "\\042", `"`)
+	return s
+}
+
+func parseMountInfo(data string) ([]mountInfoEntry, error) {
+	var entries []mountInfoEntry
+	scanner := bufio.NewScanner(strings.NewReader(data))
+	for scanner.Scan() {
+		entry, ok := parseMountInfoLine(scanner.Text())
+		if !ok {
+			continue
+		}
+		entries = append(entries, entry)
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	if len(entries) == 0 {
+		return nil, fmt.Errorf("no mount entries parsed from mountinfo")
+	}
+	return entries, nil
+}
+
+func parseMountInfoLine(line string) (mountInfoEntry, bool) {
+	sepIdx := strings.Index(line, " - ")
+	if sepIdx < 0 {
+		return mountInfoEntry{}, false
 	}
 
-	fields := strings.Fields(line)
-	if len(fields) < 2 {
-		return "", 0, fmt.Errorf("unexpected upload destination check output: %q", output)
+	lhs := strings.Fields(line[:sepIdx])
+	if len(lhs) < 5 {
+		return mountInfoEntry{}, false
 	}
 
-	base = fields[0]
-	avail, err = strconv.ParseInt(fields[1], 10, 64)
-	if err != nil {
-		return "", 0, fmt.Errorf("parse available space: %w", err)
-	}
+	return mountInfoEntry{
+		mountPoint: filepath.Clean(unescapeMountPoint(lhs[4])),
+	}, true
+}
 
-	if base != "/tmp" && base != "/var/tmp" {
-		return "", 0, fmt.Errorf("unexpected upload base path: %q", base)
+func hasTmpMountPoint(entries []mountInfoEntry) bool {
+	for _, entry := range entries {
+		if entry.mountPoint == "/tmp" {
+			return true
+		}
 	}
+	return false
+}
 
-	return base, avail, nil
+func chooseUploadBaseFromMounts(entries []mountInfoEntry) string {
+	if hasTmpMountPoint(entries) {
+		return "/var/tmp"
+	}
+	return "/tmp"
+}
+
+func parseDFAvail(output string) (int64, error) {
+	lines := strings.Split(strings.TrimSpace(output), "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := strings.TrimSpace(lines[i])
+		if line == "" || strings.EqualFold(line, "Avail") {
+			continue
+		}
+		avail, err := strconv.ParseInt(line, 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("parse available space: %w", err)
+		}
+		return avail, nil
+	}
+	return 0, fmt.Errorf("unexpected df output: %q", output)
 }
 
 func formatByteSize(n int64) string {
@@ -48,21 +101,50 @@ func formatByteSize(n int64) string {
 	return fmt.Sprintf("%.1f MB", float64(n)/float64(mb))
 }
 
-func resolveUploadDestination(sshConn *ssh.Client, filename string, fileSize int64) (destPath string, err error) {
+func readRemoteFile(sshConn *ssh.Client, path string) ([]byte, error) {
 	session, err := sshConn.NewSession()
 	if err != nil {
-		return "", fmt.Errorf("failed to create upload destination session: %w", err)
+		return nil, fmt.Errorf("failed to create session: %w", err)
 	}
 	defer session.Close()
 
-	output, err := session.CombinedOutput(uploadDestScript)
+	output, err := session.CombinedOutput("cat " + path)
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", path, err)
+	}
+	return output, nil
+}
+
+func remoteAvailableBytes(sshConn *ssh.Client, path string) (int64, error) {
+	session, err := sshConn.NewSession()
+	if err != nil {
+		return 0, fmt.Errorf("failed to create df session: %w", err)
+	}
+	defer session.Close()
+
+	output, err := session.CombinedOutput("df -B1 --output=avail " + path)
+	if err != nil {
+		return 0, fmt.Errorf("df on %s: %w", path, err)
+	}
+	return parseDFAvail(string(output))
+}
+
+func resolveUploadDestination(sshConn *ssh.Client, filename string, fileSize int64) (destPath string, err error) {
+	mountData, err := readRemoteFile(sshConn, remoteMountInfoPath)
 	if err != nil {
 		return "", fmt.Errorf("upload destination check failed: %w", err)
 	}
 
-	base, avail, err := parseUploadDestOutput(string(output))
+	entries, err := parseMountInfo(string(mountData))
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("upload destination check failed: %w", err)
+	}
+
+	base := chooseUploadBaseFromMounts(entries)
+
+	avail, err := remoteAvailableBytes(sshConn, base)
+	if err != nil {
+		return "", fmt.Errorf("upload destination check failed: %w", err)
 	}
 
 	if avail < fileSize {
