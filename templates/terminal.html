@@ -529,6 +529,10 @@
                     if (!presignResp.ok || presignData.error) {
                         throw new Error(presignData.error || ('Failed to get upload URL (HTTP ' + presignResp.status + ')'));
                     }
+                    if (!presignData.dest) {
+                        throw new Error('Server did not return upload destination path');
+                    }
+                    term.write(`\r\n\x1b[1;36mRemote destination: ${presignData.dest}\x1b[0m\r\n`);
                     
                     await new Promise((resolve, reject) => {
                         const xhr = new XMLHttpRequest();
@@ -572,7 +576,7 @@
                     socket.send(JSON.stringify({
                         type: 's3_pull',
                         key:  presignData.object_key,
-                        dest: '/tmp/' + file.name
+                        dest: presignData.dest
                     }));
                     
                 } catch (error) {

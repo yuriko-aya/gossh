@@ -205,8 +205,18 @@ func handleFileUpload(ws *safeWebSocket, sshConn *ssh.Client, msg WSMessage) {
 		return
 	}
 
-	// Create remote file path
-	remotePath := fmt.Sprintf("/tmp/%s", msg.Filename)
+	fileSize := int64(len(fileData))
+	if msg.Size > 0 {
+		fileSize = msg.Size
+	}
+
+	remotePath, err := resolveUploadDestination(sshConn, msg.Filename, fileSize)
+	if err != nil {
+		response.Success = false
+		response.Error = err.Error()
+		sendUploadResponse(ws, response)
+		return
+	}
 
 	// Create a new session to write the file
 	uploadSession, err := sshConn.NewSession()
@@ -286,11 +296,10 @@ func handleS3Pull(ws *safeWebSocket, sshConn *ssh.Client, msg WSMessage) {
 	var response UploadResponse
 	response.Type = "s3_pull_response"
 
-	// Constrain destination to /tmp/ to prevent path traversal
 	dest := filepath.Clean(msg.Dest)
-	if !strings.HasPrefix(dest, "/tmp/") {
+	if !isAllowedUploadPath(dest) {
 		response.Success = false
-		response.Error = "destination must be within /tmp/"
+		response.Error = "destination must be within /tmp/ or /var/tmp/"
 		sendUploadResponse(ws, response)
 		return
 	}
@@ -337,15 +346,17 @@ func handleS3Pull(ws *safeWebSocket, sshConn *ssh.Client, msg WSMessage) {
 	sendUploadResponse(ws, response)
 }
 
-func uploadFileViaSSH(file multipart.File, filename, host, user, password string, privateKey []byte) (string, error) {
+func uploadFileViaSSH(file multipart.File, filename string, fileSize int64, host, user, password string, privateKey []byte) (string, error) {
 	sshConn, err := dialSSH(host, user, password, privateKey)
 	if err != nil {
 		return "", err
 	}
 	defer sshConn.Close()
 
-	// Create remote file path
-	remotePath := fmt.Sprintf("/tmp/%s", filename)
+	remotePath, err := resolveUploadDestination(sshConn, filename, fileSize)
+	if err != nil {
+		return "", err
+	}
 
 	// Create a new session to write the file
 	uploadSession, err := sshConn.NewSession()

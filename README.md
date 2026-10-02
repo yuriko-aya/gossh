@@ -78,13 +78,17 @@ Credentials inside the token use these query parameter names:
 
 Large files bypass the gossh server entirely:
 
-1. Browser requests a presigned S3 PUT URL from `/presign`
-2. Browser uploads directly to S3
-3. gossh runs `wget` on the remote host via SSH to pull the file into `/tmp/`
+1. Browser requests a presigned S3 PUT URL from `/presign` (includes file size)
+2. gossh SSHes to the remote host, compares `/tmp` vs `/` mount sources, and picks `/tmp` or `/var/tmp` based on whether `/tmp` shares the root filesystem
+3. gossh verifies free space on the chosen path; if insufficient, the upload is rejected (no fallback to the other path)
+4. Browser uploads directly to S3
+5. gossh runs `wget` on the remote host via SSH to pull the file into the chosen destination (e.g. `/var/tmp/largefile.bin`)
+
+On systems where `/tmp` is a separate tmpfs (common on Ubuntu 24.04+), uploads go to `/var/tmp` which typically has more disk space.
 
 ### Download (SSH streaming)
 
-Downloads are restricted to `/home/`, `/opt/`, `/tmp/`, and `/var/log/`. Use the **Download File** button in the terminal UI.
+Downloads are restricted to `/home/`, `/opt/`, `/tmp/`, `/var/tmp/`, and `/var/log/`. Use the **Download File** button in the terminal UI.
 
 ## Configuration
 

@@ -185,7 +185,7 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	remotePath, err := uploadFileViaSSH(file, header.Filename, host, user, password, privateKey)
+	remotePath, err := uploadFileViaSSH(file, header.Filename, header.Size, host, user, password, privateKey)
 	if err != nil {
 		respondJSON(w, map[string]interface{}{
 			"success": false,
@@ -216,7 +216,8 @@ func presignHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "access token required", http.StatusBadRequest)
 		return
 	}
-	if _, err := decryptAccess(accessParam); err != nil {
+	creds, err := decryptAccess(accessParam)
+	if err != nil {
 		http.Error(w, "Invalid access token", http.StatusUnauthorized)
 		return
 	}
@@ -255,6 +256,25 @@ func presignHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	password := creds.Password
+	var privateKey []byte
+	if creds.PrivateKey != "" {
+		privateKey, _ = base64.StdEncoding.DecodeString(creds.PrivateKey)
+	}
+
+	sshConn, err := dialSSH(creds.Host, creds.User, password, privateKey)
+	if err != nil {
+		respondJSON(w, map[string]interface{}{"success": false, "error": err.Error()})
+		return
+	}
+	defer sshConn.Close()
+
+	dest, err := resolveUploadDestination(sshConn, filename, size)
+	if err != nil {
+		respondJSON(w, map[string]interface{}{"success": false, "error": err.Error()})
+		return
+	}
+
 	randBytes := make([]byte, 8)
 	if _, err := rand.Read(randBytes); err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
@@ -271,6 +291,7 @@ func presignHandler(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, map[string]interface{}{
 		"upload_url": uploadURL,
 		"object_key": objectKey,
+		"dest":       dest,
 	})
 }
 
