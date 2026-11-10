@@ -37,6 +37,8 @@ type UploadResponse struct {
 
 func handleSSHConnection(wsConn *websocket.Conn, host, user, password string, privateKey []byte) {
 	ws := newSafeWebSocket(wsConn)
+	activeSessions.register(ws)
+	defer activeSessions.unregister(ws)
 
 	sshConn, err := dialSSH(host, user, password, privateKey)
 	if err != nil {
@@ -397,6 +399,63 @@ func uploadFileViaSSH(file multipart.File, filename string, fileSize int64, host
 	return remotePath, nil
 }
 
+func downloadFileCheckCommand(remotePath string) string {
+	return fmt.Sprintf(`p='%s'
+out=$(LC_ALL=C stat -c '%%s' -- "$p" 2>&1) || {
+  case "$out" in
+    *"Permission denied"*) echo PERMISSION_DENIED; exit 0 ;;
+    *) echo NOT_FOUND; exit 0 ;;
+  esac
+}
+[ -f "$p" ] || { echo NOT_REGULAR; exit 0; }
+[ -r "$p" ] || { echo PERMISSION_DENIED; exit 0; }
+echo "OK $out"
+`, remotePath)
+}
+
+func permissionDeniedDownloadError(remotePath string) error {
+	return fmt.Errorf("permission denied: cannot access %s; copy it to /tmp (e.g. sudo cp '%s' /tmp/) then download from /tmp", remotePath, remotePath)
+}
+
+func fileNotFoundDownloadError(remotePath string) error {
+	return fmt.Errorf("file not found or not a regular file: %s", remotePath)
+}
+
+func parseFileCheckOutput(output, remotePath string) (int64, error) {
+	line := strings.TrimSpace(output)
+	switch {
+	case line == "PERMISSION_DENIED":
+		return 0, permissionDeniedDownloadError(remotePath)
+	case line == "NOT_FOUND", line == "NOT_REGULAR":
+		return 0, fileNotFoundDownloadError(remotePath)
+	case strings.HasPrefix(line, "OK "):
+		var size int64
+		if _, err := fmt.Sscanf(line, "OK %d", &size); err != nil {
+			return 0, fmt.Errorf("failed to get file information: %v", err)
+		}
+		return size, nil
+	default:
+		if line == "" {
+			return 0, fmt.Errorf("failed to get file information")
+		}
+		return 0, fmt.Errorf("failed to get file information: %s", line)
+	}
+}
+
+func checkDownloadFile(sshConn *ssh.Client, remotePath string) (int64, error) {
+	session, err := sshConn.NewSession()
+	if err != nil {
+		return 0, fmt.Errorf("failed to create session: %v", err)
+	}
+	defer session.Close()
+
+	output, err := session.CombinedOutput(downloadFileCheckCommand(remotePath))
+	if err != nil {
+		return 0, fmt.Errorf("failed to get file information: %v", err)
+	}
+	return parseFileCheckOutput(string(output), remotePath)
+}
+
 func validateFileViaSSH(remotePath, host, user, password string, privateKey []byte) (map[string]interface{}, error) {
 	if !isAllowedDownloadPath(remotePath) {
 		return nil, fmt.Errorf("access denied: downloads are only allowed from /home, /opt, /var/log, and /tmp directories")
@@ -408,30 +467,13 @@ func validateFileViaSSH(remotePath, host, user, password string, privateKey []by
 	}
 	defer sshConn.Close()
 
-	// Create a session to check file
-	session, err := sshConn.NewSession()
+	fileSize, err := checkDownloadFile(sshConn, remotePath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create session: %v", err)
+		return nil, err
 	}
-	defer session.Close()
-
-	// Check if file exists and get its size using stat
-	output, err := session.CombinedOutput(fmt.Sprintf("test -f '%s' && stat -c '%%s' '%s' || echo 'NOT_FOUND'", remotePath, remotePath))
-	if err != nil || strings.TrimSpace(string(output)) == "NOT_FOUND" {
-		return nil, fmt.Errorf("file not found or not a regular file: %s", remotePath)
-	}
-
-	// Parse file size
-	var fileSize int64
-	if _, err := fmt.Sscanf(string(output), "%d", &fileSize); err != nil {
-		return nil, fmt.Errorf("failed to get file information: %v", err)
-	}
-
-	// Extract filename from path
-	filename := filepath.Base(remotePath)
 
 	return map[string]interface{}{
-		"filename": filename,
+		"filename": filepath.Base(remotePath),
 		"size":     fileSize,
 	}, nil
 }
@@ -466,24 +508,11 @@ func downloadFileViaSSH(w http.ResponseWriter, remotePath, host, user, password 
 		return "", fmt.Errorf("failed to get stderr pipe: %v", err)
 	}
 
-	// Extract filename from path
 	filename := filepath.Base(remotePath)
 
-	// Get file size first using stat command
-	statSession, err := sshConn.NewSession()
+	fileSize, err := checkDownloadFile(sshConn, remotePath)
 	if err != nil {
-		return "", fmt.Errorf("failed to create stat session: %v", err)
-	}
-	statOutput, err := statSession.CombinedOutput(fmt.Sprintf("stat -c %%s '%s'", remotePath))
-	statSession.Close()
-	if err != nil {
-		return "", fmt.Errorf("failed to get file size: %v", err)
-	}
-
-	// Parse file size
-	var fileSize int64
-	if _, err := fmt.Sscanf(string(statOutput), "%d", &fileSize); err != nil {
-		return "", fmt.Errorf("failed to parse file size: %v", err)
+		return "", err
 	}
 
 	// Start the cat command - do this before setting headers

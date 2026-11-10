@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
@@ -10,8 +11,10 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
+	"syscall"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -77,10 +80,30 @@ func main() {
 	http.HandleFunc("/static/", noCacheStaticHandler)
 
 	addr := fmt.Sprintf("%s:%d", config.Server.Address, config.Server.Port)
-	log.Printf("Server starting on %s", addr)
-	if err := http.ListenAndServe(addr, nil); err != nil {
-		log.Fatal(err)
+	srv := &http.Server{Addr: addr}
+
+	go func() {
+		log.Printf("Server starting on %s", addr)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("Server error: %v", err)
+		}
+	}()
+
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGTERM, syscall.SIGINT)
+	sig := <-quit
+	log.Printf("Received %v, shutting down...", sig)
+
+	activeSessions.closeAll()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Printf("HTTP shutdown error: %v", err)
 	}
+
+	activeSessions.wait()
+	log.Println("Shutdown complete")
 }
 
 func noCacheStaticHandler(w http.ResponseWriter, r *http.Request) {

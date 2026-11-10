@@ -10,6 +10,7 @@ WorkingDirectory=/opt/gossh
 ExecStart=/opt/gossh/gossh
 Restart=always
 RestartSec=10
+TimeoutStopSec=35
 
 # Security hardening
 NoNewPrivileges=true
